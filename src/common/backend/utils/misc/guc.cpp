@@ -9363,6 +9363,9 @@ void ExecSetVariableStmt(VariableSetStmt* stmt, ParamListInfo paramInfo)
                 ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmsg("identity and last_insert_id is not supported for setting")));
             }
+            if (strcasecmp(stmt->name, "_d_virtual_value") == 0 && DB_IS_CMPT(D_FORMAT)) {
+                break;
+            }
             (void)set_config_option(stmt->name,
                 ExtractSetVariableArgs(stmt),
                 ((superuser() || (isOperatoradmin(GetUserId()) && u_sess->attr.attr_security.operation_mode)) ?
