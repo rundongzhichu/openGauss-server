@@ -313,6 +313,7 @@ static char* IdentResolveToChar(char *ident, core_yyscan_t yyscanner);
 static void contain_unsupport_node(Node* node, bool* has_unsupport_default_node);
 static List* TransformToConstStrNode(List *inExprList, char* raw_str);
 static Alias* generate_alias(Alias* clone_target, const char* default_alias_name);
+static void Funcname_Judge(List *names, List *args);
 
 /* Please note that the following line will be replaced with the contents of given file name even if with starting with a comment */
 /*$$include "gram-tsql-prologue.y.h"*/
@@ -29388,6 +29389,9 @@ ignNulls: 	IGNORE NULLS_P
 func_application:	func_name '(' func_arg_list opt_sort_clause ')'
 				{
 					FuncCall *n = makeNode(FuncCall);
+					if (DB_IS_CMPT(D_FORMAT)) {
+						Funcname_Judge($1, $3);
+					}
 					ListCell* l = list_head($1);
 					n->funcname = $1;
 					n->args = $3;
@@ -35178,6 +35182,30 @@ static Alias* generate_alias(Alias* clone_target, const char* default_alias_name
 	}
 }
 
+static void Funcname_Judge(List *names, List *args)
+{
+    if (list_length(names) > 2 || (list_length(names)== 2 && strcmp(strVal(lfirst(list_head(names))), "sys") != 0)) {
+        return;
+    }
+
+    char *funcname = strVal(lfirst(list_tail(names)));
+
+    if (strcmp(funcname, "datename") == 0 || strcmp(funcname, "datepart") == 0) {
+        Node *firstnode = (Node *)linitial(args);
+        if (IsA(firstnode, ColumnRef) && list_length(((ColumnRef *) firstnode)->fields) == 1 &&
+            IsA(linitial(((ColumnRef *) firstnode)->fields), String) && list_length(args) == 2) {
+            char *name = strVal(linitial(((ColumnRef *) firstnode)->fields));
+            linitial(args) = makeStringConst(name, -1);
+        }
+    } else if (strcmp(funcname, "dateadd") == 0) {
+        Node *firstnode = (Node *)linitial(args);
+        if (IsA(firstnode, ColumnRef) && list_length(((ColumnRef *) firstnode)->fields) == 1 &&
+            IsA(linitial(((ColumnRef *) firstnode)->fields), String) && list_length(args) == 3) {
+            char *name = strVal(linitial(((ColumnRef *) firstnode)->fields));
+            linitial(args) = makeStringConst(name, -1);
+        }
+    }
+}
 /*
  * Must undefine this stuff before including scan.c, since it has different
  * definitions for these macros.
