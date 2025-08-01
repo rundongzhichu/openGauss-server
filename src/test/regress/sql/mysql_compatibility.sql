@@ -594,7 +594,43 @@ SELECT @a, avg(a) as xx FROM tt_bug1 GROUP BY @a:= 11;
 set enable_set_variable_b_format = 0;
 select @var_t_1 := 2;
 
+set b_format_behavior_compat_options=enable_set_variables;
 
+CREATE TABLE tb_1101383 (
+depname varchar,
+empno bigint,
+salary int,
+enroll_date date
+);
+
+INSERT INTO tb_1101383 VALUES
+('develop', 10, 5200, '2007-08-01'),
+('sales', 1, 5000, '2006-10-01'),
+('personnel', 5, 3500, '2007-12-10'),
+('sales', 4, 4800, '2007-08-08'),
+('personnel', 2, 3900, '2006-12-23'),
+('develop', 7, 4200, '2008-01-01');
+
+select b.enroll_date,b.rownum1 from (select (@rownum1:=@rownum1+1) AS rownum1,td.* from tb_1101383 td,(select @rownum1:=0)r where td.enroll_date<'2008-01-01' and td.depname='sales' order by td.enroll_date desc)b where b.rownum1<3;
+
+select b.enroll_date,b.rownum1 from (select (@rownum1:=@rownum1+1) AS rownum1,td.* from tb_1101383 td,(select @rownum1:=0)r where td.enroll_date<'2008-01-01' and td.depname='sales')b where b.rownum1<3;
+
+select (@rownum1:=@rownum1+1) AS rownum1,td.* from tb_1101383 td,(select @rownum1:=0)r where td.enroll_date<'2008-01-01' and td.depname='sales' order by td.enroll_date desc;
+
+select (@rownum1:=@rownum1+1) AS rownum1,td.* from tb_1101383 td,(select @rownum1:=0)r where td.enroll_date<'2008-01-01' and td.depname='sales' order by td.enroll_date asc;
+
+select (@rownum1:=@rownum1+1) AS rownum1,td.* from tb_1101383 td,(select @rownum1:=0)r where td.enroll_date<'2008-01-01' and td.depname='sales';
+
+set @rownum1 = 5;
+select (@rownum1:=@rownum1+1) AS rownum1,td.* from tb_1101383 td where td.enroll_date<'2008-01-01' and td.depname='sales' order by td.enroll_date desc;
+
+set @rownum1 = 5;
+select (@rownum1:=@rownum1+1) AS rownum1,td.* from tb_1101383 td where td.enroll_date<'2008-01-01' and td.depname='sales' order by td.enroll_date asc;
+
+set @rownum1 = 5;
+select (@rownum1:=@rownum1+1) AS rownum1,td.* from tb_1101383 td where td.enroll_date<'2008-01-01' and td.depname='sales';
+
+drop TABLE tb_1101383;
 
 \c regression
 
