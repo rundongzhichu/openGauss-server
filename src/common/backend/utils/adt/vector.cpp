@@ -1834,12 +1834,5 @@ int PlanCreateIndexWorkers(Relation heapRelation, IndexInfo *indexInfo)
 
 double VectorSquareNorm(float* x, int dim)
 {
-    double norm = 0.0;
-
-    /* Auto-vectorized */
-    for (int i = 0; i < dim; i++) {
-        norm += (double)x[i] * (double)x[i];
-    }
-
-    return norm;
+    return (double)VectorInnerProduct(dim, x, x);
 }
