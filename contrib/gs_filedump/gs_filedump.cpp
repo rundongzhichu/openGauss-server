@@ -105,6 +105,7 @@ bool g_isSegment;
 /*
  * Function Prototypes
  */
+
 static void DisplayOptions(unsigned int validOptions);
 static unsigned int ConsumeOptions(int numOptions, char **options);
 static int GetOptionValue(char *optionString);
@@ -145,6 +146,120 @@ static const char *wal_level_str(WalLevel wal_level)
     }
     return _("unrecognized wal_level");
 }
+
+static const DbStateMapping dbStateTable[] = {
+    {DB_STARTUP, "STARTUP"},
+    {DB_SHUTDOWNED, "SHUTDOWNED"},
+    {DB_SHUTDOWNED_IN_RECOVERY, "SHUTDOWNED_IN_RECOVERY"},
+    {DB_SHUTDOWNING, "SHUTDOWNING"},
+    {DB_IN_CRASH_RECOVERY, "IN CRASH RECOVERY"},
+    {DB_IN_ARCHIVE_RECOVERY, "IN ARCHIVE RECOVERY"},
+    {DB_IN_PRODUCTION, "IN PRODUCTION"},
+    {-1, "UNKNOWN"}  // default
+};
+
+static const FlagMapping flagTable[] = {
+    {UHEAP_HAS_NULL, "UHEAP_HAS_NULL"},
+    {UHEAP_HASVARWIDTH, "UHEAP_HASVARWIDTH"},
+    {UHEAP_HASEXTERNAL, "UHEAP_HASEXTERNAL"},
+    {UHEAP_DELETED, "UHEAP_DELETED"},
+    {UHEAP_INPLACE_UPDATED, "UHEAP_INPLACE_UPDATED"},
+    {UHEAP_UPDATED, "UHEAP_UPDATED"},
+    {UHEAP_XID_KEYSHR_LOCK, "UHEAP_XID_KEYSHR_LOCK"},
+    {UHEAP_XID_NOKEY_EXCL_LOCK, "UHEAP_XID_NOKEY_EXCL_LOCK"},
+    {UHEAP_XID_EXCL_LOCK, "UHEAP_XID_EXCL_LOCK"},
+    {UHEAP_MULTI_LOCKERS, "UHEAP_MULTI_LOCKERS"},
+    {UHEAP_INVALID_XACT_SLOT, "UHEAP_INVALID_XACT_SLOT"},
+    {UHEAP_XID_COMMITTED, "UHEAP_XID_COMMITTED"},
+    {UHEAP_XID_INVALID, "UHEAP_XID_INVALID"},
+    {UHEAP_XID_FROZEN, "UHEAP_XID_FROZEN"}
+};
+
+static const FlagMapping btreeFlagTable[] = {
+    {BTP_LEAF, "LEAF"},
+    {BTP_ROOT, "ROOT"},
+    {BTP_DELETED, "DELETED"},
+    {BTP_META, "META"},
+    {BTP_HALF_DEAD, "HALFDEAD"},
+    {BTP_SPLIT_END, "SPLITEND"},
+    {BTP_HAS_GARBAGE, "HASGARBAGE"},
+    {BTP_INCOMPLETE_SPLIT, "INCOMPLETESPLIT"}
+};
+
+static const FlagMapping hashFlagTable[] = {
+    {LH_UNUSED_PAGE, "UNUSED"},
+    {LH_OVERFLOW_PAGE, "OVERFLOW"},
+    {LH_BUCKET_PAGE, "BUCKET"},
+    {LH_BITMAP_PAGE, "BITMAP"},
+    {LH_META_PAGE, "META"},
+    {LH_BUCKET_BEING_POPULATED, "BUCKET_BEING_POPULATED"},
+    {LH_BUCKET_BEING_SPLIT, "BUCKET_BEING_SPLIT"},
+    {LH_BUCKET_NEEDS_SPLIT_CLEANUP, "BUCKET_NEEDS_SPLIT_CLEANUP"},
+    {LH_PAGE_HAS_DEAD_TUPLES, "PAGE_HAS_DEAD_TUPLES"}
+};
+
+static const FlagMapping gistFlagTable[] = {
+    {F_LEAF, "LEAF"},
+    {F_DELETED, "DELETED"},
+    {F_TUPLES_DELETED, "TUPLES_DELETED"},
+    {F_FOLLOW_RIGHT, "FOLLOW_RIGHT"},
+    {F_HAS_GARBAGE, "HAS_GARBAGE"}
+};
+
+static const FlagMapping spgistFlagTable[] = {
+    {SPGIST_META, "META"},
+    {SPGIST_DELETED, "DELETED"},
+    {SPGIST_LEAF, "LEAF"},
+    {SPGIST_NULLS, "NULLS"}
+};
+
+static const FlagMapping ginFlagTable[] = {
+    {GIN_DATA, "DATA"},
+    {GIN_LEAF, "LEAF"},
+    {GIN_DELETED, "DELETED"},
+    {GIN_META, "META"},
+    {GIN_LIST, "LIST"},
+    {GIN_LIST_FULLROW, "FULLROW"},
+    {GIN_INCOMPLETE_SPLIT, "INCOMPLETESPLIT"},
+    {GIN_COMPRESSED, "COMPRESSED"}
+};
+
+static const FlagMapping pageFlagTable[] = {
+    {PD_HAS_FREE_LINES, "HAS_FREE_LINES"},
+    {PD_PAGE_FULL, "PAGE_FULL"},
+    {PD_ALL_VISIBLE, "ALL_VISIBLE"},
+    {PD_COMPRESSED_PAGE, "COMPRESSED_PAGE"},
+    {PD_LOGICAL_PAGE, "LOGICAL_PAGE"},
+    {PD_ENCRYPT_PAGE, "ENCRYPT_PAGE"},
+    {UHEAP_PAGE_FULL, "UPAGE_IS_FULL"},
+    {UHEAP_HAS_FREE_LINES, "UPAGE_HAS_FREE_LINE_POINTERS"},
+    {PD_CHECKSUM_FNV1A, "CHECKSUM_FNV1A"},
+    {PD_JUST_AFTER_FPW, "JUST_AFTER_FPW"},
+    {PD_EXRTO_PAGE, "EXRTO_PAGE"},
+    {PD_TDE_PAGE, "TDE_PAGE"}
+};
+
+static const FlagMapping maskFlags[] = {
+    {HEAP_HASNULL, "HASNULL"},
+    {HEAP_HASVARWIDTH, "HASVARWIDTH"},
+    {HEAP_HASEXTERNAL, "HASEXTERNAL"},
+    {HEAP_HASOID, "HASOID"},
+    {HEAP_XMAX_KEYSHR_LOCK, "XMAX_KEYSHR_LOCK"},
+    {HEAP_COMBOCID, "COMBOCID"},
+    {HEAP_XMAX_EXCL_LOCK, "XMAX_EXCL_LOCK"},
+    {HEAP_XMAX_LOCK_ONLY, "XMAX_LOCK_ONLY"},
+    {HEAP_XMIN_COMMITTED, "XMIN_COMMITTED"},
+    {HEAP_XMIN_INVALID, "XMIN_INVALID"},
+    {HEAP_XMAX_COMMITTED, "XMAX_COMMITTED"},
+    {HEAP_XMAX_INVALID, "XMAX_INVALID"},
+    {HEAP_XMAX_IS_MULTI, "XMAX_IS_MULTI"},
+    {HEAP_UPDATED, "UPDATED"},
+    {HEAP_MOVED_OFF, "MOVED_OFF"},
+    {HEAP_MOVED_IN, "MOVED_IN"},
+    {HEAP_KEYS_UPDATED, "KEYS_UPDATED"},
+    {HEAP_HOT_UPDATED, "HOT_UPDATED"},
+    {HEAP_ONLY_TUPLE, "HEAP_ONLY"},
+};
 
 /* Send properly formed usage information to the user. */
 static void DisplayOptions(unsigned int validOptions)
@@ -877,7 +992,8 @@ static void CreateDumpFileHeader(int numOptions, char **options)
             printf(" Error: Dump FileHeader Failed.\n\n");
         }
         if (x < numOptions - 2) {
-            strcat_s(optionBuffer, sizeof(optionBuffer), " ");
+            errno_t rc = strcat_s(optionBuffer, sizeof(optionBuffer), " ");
+            securec_check(rc, "\0", "\0");
         }
     }
     printf("\n*******************************************************************\n"
@@ -926,36 +1042,16 @@ static int FormatHeader(char *buffer, Page page, BlockNumber blkno, bool isToast
         }
 
         flagString[0] = '\0';
-        if (pageHeader->pd_flags & PD_HAS_FREE_LINES) {
-            strcat_s(flagString, sizeof(flagString), "HAS_FREE_LINES|");
+        errno_t rc;
+        for (const auto& entry : pageFlagTable) {
+            if (pageHeader->pd_flags & entry.mask) {
+                rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                securec_check(rc, "\0", "\0");
+                rc = strcat_s(flagString, sizeof(flagString), "|");
+                securec_check(rc, "\0", "\0");
+            }
         }
-        if (pageHeader->pd_flags & PD_PAGE_FULL) {
-            strcat_s(flagString, sizeof(flagString), "PAGE_FULL|");
-        }
-        if (pageHeader->pd_flags & PD_ALL_VISIBLE) {
-            strcat_s(flagString, sizeof(flagString), "ALL_VISIBLE|");
-        }
-        if (PageIsCompressed(page)) {
-            strcat_s(flagString, sizeof(flagString), "COMPRESSED_PAGE|");
-        }
-        if (PageIsLogical(page)) {
-            strcat_s(flagString, sizeof(flagString), "LOGICAL_PAGE|");
-        }
-        if (PageIsEncrypt(page)) {
-            strcat_s(flagString, sizeof(flagString), "ENCRYPT_PAGE|");
-        }
-        if (pageHeader->pd_flags & PD_CHECKSUM_FNV1A) {
-            strcat_s(flagString, sizeof(flagString), "CHECKSUM_FNV1A|");
-        }
-        if (pageHeader->pd_flags & PD_JUST_AFTER_FPW) {
-            strcat_s(flagString, sizeof(flagString), "JUST_AFTER_FPW|");
-        }
-        if (pageHeader->pd_flags & PD_EXRTO_PAGE) {
-            strcat_s(flagString, sizeof(flagString), "EXRTO_PAGE|");
-        }
-        if (pageHeader->pd_flags & PD_TDE_PAGE) {
-            strcat_s(flagString, sizeof(flagString), "TDE_PAGE|");
-        }
+        
         if (strlen(flagString)) {
             flagString[strlen(flagString) - 1] = '\0';
         }
@@ -1064,20 +1160,14 @@ static int FormatUHeapHeader(char *buffer, Page page, BlockNumber blkno, bool is
         }
 
         flagString[0] = '\0';
-        if (upageHeader->pd_flags & UHEAP_HAS_FREE_LINES) {
-            strcat_s(flagString, sizeof(flagString), "HAS_FREE_LINES|");
-        }
-        if (upageHeader->pd_flags & UHEAP_PAGE_FULL) {
-            strcat_s(flagString, sizeof(flagString), "PAGE_FULL|");
-        }
-        if (upageHeader->pd_flags & UHP_ALL_VISIBLE) {
-            strcat_s(flagString, sizeof(flagString), "ALL_VISIBLE|");
-        }
-        if (UPageIsFull(page)) {
-            strcat_s(flagString, sizeof(flagString), "UPAGE_IS_FULL|");
-        }
-        if (UPageHasFreeLinePointers(page)) {
-            strcat_s(flagString, sizeof(flagString), "UPAGE_HAS_FREE_LINE_POINTERS|");
+        errno_t rc;
+        for (const auto& entry : pageFlagTable) {
+            if (upageHeader->pd_flags & entry.mask) {
+                rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                securec_check(rc, "\0", "\0");
+                rc = strcat_s(flagString, sizeof(flagString), "|");
+                securec_check(rc, "\0", "\0");
+            }
         }
         if (strlen(flagString)) {
             flagString[strlen(flagString) - 1] = '\0';
@@ -1851,63 +1941,14 @@ static void FormatItem(char *buffer, unsigned int numBytes, unsigned int startIn
             /* Place readable versions of the tuple info mask into a buffer.
              * Assume that the string can not expand beyond 256. */
             flagString[0] = '\0';
-            if (infoMask & HEAP_HASNULL) {
-                strcat_s(flagString, sizeof(flagString), "HASNULL|");
-            }
-            if (infoMask & HEAP_HASVARWIDTH) {
-                strcat_s(flagString, sizeof(flagString), "HASVARWIDTH|");
-            }
-            if (infoMask & HEAP_HASEXTERNAL) {
-                strcat_s(flagString, sizeof(flagString), "HASEXTERNAL|");
-            }
-            if (infoMask & HEAP_HASOID) {
-                strcat_s(flagString, sizeof(flagString), "HASOID|");
-            }
-            if (infoMask & HEAP_XMAX_KEYSHR_LOCK) {
-                strcat_s(flagString, sizeof(flagString), "XMAX_KEYSHR_LOCK|");
-            }
-            if (infoMask & HEAP_COMBOCID) {
-                strcat_s(flagString, sizeof(flagString), "COMBOCID|");
-            }
-            if (infoMask & HEAP_XMAX_EXCL_LOCK) {
-                strcat_s(flagString, sizeof(flagString), "XMAX_EXCL_LOCK|");
-            }
-            if (infoMask & HEAP_XMAX_LOCK_ONLY) {
-                strcat_s(flagString, sizeof(flagString), "XMAX_LOCK_ONLY|");
-            }
-            if (infoMask & HEAP_XMIN_COMMITTED) {
-                strcat_s(flagString, sizeof(flagString), "XMIN_COMMITTED|");
-            }
-            if (infoMask & HEAP_XMIN_INVALID) {
-                strcat_s(flagString, sizeof(flagString), "XMIN_INVALID|");
-            }
-            if (infoMask & HEAP_XMAX_COMMITTED) {
-                strcat_s(flagString, sizeof(flagString), "XMAX_COMMITTED|");
-            }
-            if (infoMask & HEAP_XMAX_INVALID) {
-                strcat_s(flagString, sizeof(flagString), "XMAX_INVALID|");
-            }
-            if (infoMask & HEAP_XMAX_IS_MULTI) {
-                strcat_s(flagString, sizeof(flagString), "XMAX_IS_MULTI|");
-            }
-            if (infoMask & HEAP_UPDATED) {
-                strcat_s(flagString, sizeof(flagString), "UPDATED|");
-            }
-            if (infoMask & HEAP_MOVED_OFF) {
-                strcat_s(flagString, sizeof(flagString), "MOVED_OFF|");
-            }
-            if (infoMask & HEAP_MOVED_IN) {
-                strcat_s(flagString, sizeof(flagString), "MOVED_IN|");
-            }
-
-            if (infoMask2 & HEAP_KEYS_UPDATED) {
-                strcat_s(flagString, sizeof(flagString), "KEYS_UPDATED|");
-            }
-            if (infoMask2 & HEAP_HOT_UPDATED) {
-                strcat_s(flagString, sizeof(flagString), "HOT_UPDATED|");
-            }
-            if (infoMask2 & HEAP_ONLY_TUPLE) {
-                strcat_s(flagString, sizeof(flagString), "HEAP_ONLY|");
+            errno_t rc;
+            for (const FlagMapping& entry : maskFlags) {
+                if ((infoMask & entry.mask) || (infoMask2 & entry.mask)) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
             }
 
             if (strlen(flagString)) {
@@ -2082,47 +2123,14 @@ static void FormatUHeapItem(char *buffer, unsigned int numBytes, unsigned int st
             /* Place readable versions of the tuple info mask into a buffer.
              * Assume that the string can not expand beyond 256. */
             flagString[0] = '\0';
-            if (infoMask & UHEAP_HAS_NULL) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_HAS_NULL|");
-            }
-            if (infoMask & UHEAP_HASVARWIDTH) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_HASVARWIDTH|");
-            }
-            if (infoMask & UHEAP_HASEXTERNAL) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_HASEXTERNAL|");
-            }
-            if (infoMask & UHEAP_DELETED) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_DELETED|");
-            }
-            if (infoMask & UHEAP_INPLACE_UPDATED) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_INPLACE_UPDATED|");
-            }
-            if (infoMask & UHEAP_UPDATED) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_UPDATED|");
-            }
-            if (infoMask & UHEAP_XID_KEYSHR_LOCK) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_XID_KEYSHR_LOCK|");
-            }
-            if (infoMask & UHEAP_XID_NOKEY_EXCL_LOCK) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_XID_NOKEY_EXCL_LOCK|");
-            }
-            if (infoMask & UHEAP_XID_EXCL_LOCK) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_XID_EXCL_LOCK|");
-            }
-            if (infoMask & UHEAP_MULTI_LOCKERS) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_MULTI_LOCKERS|");
-            }
-            if (infoMask & UHEAP_INVALID_XACT_SLOT) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_INVALID_XACT_SLOT|");
-            }
-            if (infoMask & UHEAP_XID_COMMITTED) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_XID_COMMITTED|");
-            }
-            if (infoMask & UHEAP_XID_INVALID) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_XID_INVALID|");
-            }
-            if (infoMask & UHEAP_XID_FROZEN) {
-                strcat_s(flagString, sizeof(flagString), "UHEAP_XID_FROZEN|");
+            errno_t rc;
+            for (const auto& entry : flagTable) {
+                if (infoMask & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
             }
 
             if (strlen(flagString)) {
@@ -2143,6 +2151,510 @@ static void FormatUHeapItem(char *buffer, unsigned int numBytes, unsigned int st
 
             printf("\n");
         }
+    }
+}
+
+/* On blocks that have special sections, print the contents
+ * according to previously determined special section type */
+static void FormatSpecial(char *buffer)
+{
+    PageHeader pageHeader = (PageHeader)buffer;
+    char flagString[100] = "\0";
+    unsigned int specialOffset = pageHeader->pd_special;
+    unsigned int specialSize = (g_blockSize >= specialOffset) ? (g_blockSize - specialOffset) : 0;
+    errno_t rc;
+    printf("<Special Section> -----\n");
+    switch (g_specialType) {
+        case SPEC_SECT_ERROR_UNKNOWN:
+        case SPEC_SECT_ERROR_BOUNDARY:
+            printf(" Error: Invalid special section encountered.\n");
+            g_exitCode = 1;
+            break;
+
+        case SPEC_SECT_SEQUENCE:
+            printf(" Sequence: 0x%08x\n", SEQUENCE_MAGIC);
+            break;
+
+            /* Btree index section */
+        case SPEC_SECT_INDEX_BTREE: {
+            BTPageOpaque btreeSection = (BTPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : btreeFlagTable) {
+                if (btreeSection->bt_internal.btpo_flags & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+
+            printf(" BTree Index Section:\n"
+                   "  Flags: 0x%04x (%s)\n"
+                   "  Blocks: Previous (%d)  Next (%d)  %s (%d)  CycleId (%d)\n\n",
+                   btreeSection->bt_internal.btpo_flags, flagString, btreeSection->bt_internal.btpo_prev,
+                   btreeSection->bt_internal.btpo_next,
+                   (btreeSection->bt_internal.btpo_flags & BTP_DELETED) ? "Next XID" : "Level",
+                   btreeSection->bt_internal.btpo.level, btreeSection->bt_internal.btpo_cycleid);
+            break;
+        }
+        /* Hash index section */
+        case SPEC_SECT_INDEX_HASH: {
+            HashPageOpaque hashSection = (HashPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : hashFlagTable) {
+                if (hashSection->hasho_flag & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+
+            printf(" Hash Index Section:\n"
+                   "  Flags: 0x%04x (%s)\n"
+                   "  Bucket Number: 0x%04x\n"
+                   "  Blocks: Previous (%d)  Next (%d)\n\n",
+                   hashSection->hasho_flag, flagString, hashSection->hasho_bucket, hashSection->hasho_prevblkno,
+                   hashSection->hasho_nextblkno);
+            break;
+        }
+            /* GIST index section */
+        case SPEC_SECT_INDEX_GIST: {
+            GISTPageOpaque gistSection = (GISTPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : gistFlagTable) {
+                if (gistSection->flags & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+            printf(" GIST Index Section:\n"
+                   "  NSN: 0x%08lx\n"
+                   "  RightLink: %d\n"
+                   "  Flags: 0x%08x (%s)\n"
+                   "  GIST_page_id: 0x%08x\n\n",
+                   gistSection->nsn, gistSection->rightlink, gistSection->flags, flagString, gistSection->gist_page_id);
+            break;
+        }
+        /* GIN index section */
+        case SPEC_SECT_INDEX_GIN: {
+            GinPageOpaque ginSection = (GinPageOpaque)(buffer + specialOffset);
+            for (const auto& entry : ginFlagTable) {
+                if (ginSection->flags & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+            printf(" GIN Index Section:\n"
+                   "  Flags: 0x%08x (%s)  Maxoff: %d\n"
+                   "  Blocks: RightLink (%d)\n\n",
+                   ginSection->flags, flagString, ginSection->maxoff, ginSection->rightlink);
+            break;
+        }
+        /* SP-GIST index section */
+        case SPEC_SECT_INDEX_SPGIST: {
+            SpGistPageOpaque spgistSection = (SpGistPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : spgistFlagTable) {
+                if (spgistSection->flags & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+            printf(" SPGIST Index Section:\n"
+                   "  Flags: 0x%08x (%s)\n"
+                   "  nRedirection: %d\n"
+                   "  nPlaceholder: %d\n\n",
+                   spgistSection->flags, flagString, spgistSection->nRedirection, spgistSection->nPlaceholder);
+            break;
+        }
+        /* No idea what type of special section this is */
+        default:
+            printf(" Unknown special section type. Type: <%u>.\n", g_specialType);
+            g_exitCode = 1;
+            break;
+    }
+
+    /* Dump the formatted contents of the special section */
+    if (g_blockOptions & BLOCK_FORMAT) {
+        if (g_specialType == SPEC_SECT_ERROR_BOUNDARY) {
+            printf(" Error: Special section points off page."
+                   " Unable to dump contents.\n");
+
+            g_exitCode = 1;
+        } else {
+            FormatBinary(buffer, specialSize, specialOffset);
+        }
+    }
+}
+
+/* On blocks that have special sections, print the contents
+ * according to previously determined special section type */
+static void FormatUHeapSpecial(char *buffer)
+{
+    UHeapPageHeader upageHeader = (UHeapPageHeader)buffer;
+    char flagString[100] = "\0";
+    unsigned int specialOffset = upageHeader->pd_special;
+    unsigned int specialSize = (g_blockSize >= specialOffset) ? (g_blockSize - specialOffset) : 0;
+    errno_t rc;
+    printf("<Special Section> -----\n");
+
+    switch (g_specialType) {
+        case SPEC_SECT_ERROR_UNKNOWN:
+        case SPEC_SECT_ERROR_BOUNDARY:
+            printf(" Error: Invalid special section encountered.\n");
+            g_exitCode = 1;
+            break;
+
+        case SPEC_SECT_SEQUENCE:
+            printf(" Sequence: 0x%08x\n", SEQUENCE_MAGIC);
+            break;
+
+            /* Btree index section */
+        case SPEC_SECT_INDEX_BTREE: {
+            BTPageOpaque btreeSection = (BTPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : btreeFlagTable) {
+                if (btreeSection->bt_internal.btpo_flags & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+
+            printf(" BTree Index Section:\n"
+                   "  Flags: 0x%04x (%s)\n"
+                   "  Blocks: Previous (%d)  Next (%d)  %s (%d)  CycleId (%d)\n\n",
+                   btreeSection->bt_internal.btpo_flags, flagString, btreeSection->bt_internal.btpo_prev,
+                   btreeSection->bt_internal.btpo_next,
+                   (btreeSection->bt_internal.btpo_flags & BTP_DELETED) ? "Next XID" : "Level",
+                   btreeSection->bt_internal.btpo.level, btreeSection->bt_internal.btpo_cycleid);
+            break;
+        }
+            /* Hash index section */
+        case SPEC_SECT_INDEX_HASH: {
+            HashPageOpaque hashSection = (HashPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : hashFlagTable) {
+                if (hashSection->hasho_flag & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+            printf(" Hash Index Section:\n"
+                   "  Flags: 0x%04x (%s)\n"
+                   "  Bucket Number: 0x%04x\n"
+                   "  Blocks: Previous (%d)  Next (%d)\n\n",
+                   hashSection->hasho_flag, flagString, hashSection->hasho_bucket, hashSection->hasho_prevblkno,
+                   hashSection->hasho_nextblkno);
+            break;
+        }
+            /* GIST index section */
+        case SPEC_SECT_INDEX_GIST: {
+            GISTPageOpaque gistSection = (GISTPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : gistFlagTable) {
+                if (gistSection->flags & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+            printf(" GIST Index Section:\n"
+                   "  NSN: 0x%08lx\n"
+                   "  RightLink: %d\n"
+                   "  Flags: 0x%08x (%s)\n"
+                   "  GIST_page_id: 0x%08x\n\n",
+                   gistSection->nsn, gistSection->rightlink, gistSection->flags, flagString, gistSection->gist_page_id);
+            break;
+        }
+            /* GIN index section */
+        case SPEC_SECT_INDEX_GIN: {
+            GinPageOpaque ginSection = (GinPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : ginFlagTable) {
+                if (ginSection->flags & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+
+            printf(" GIN Index Section:\n"
+                   "  Flags: 0x%08x (%s)  Maxoff: %d\n"
+                   "  Blocks: RightLink (%d)\n\n",
+                   ginSection->flags, flagString, ginSection->maxoff, ginSection->rightlink);
+            break;
+        }
+            /* SP-GIST index section */
+        case SPEC_SECT_INDEX_SPGIST: {
+            SpGistPageOpaque spgistSection = (SpGistPageOpaque)(buffer + specialOffset);
+
+            for (const auto& entry : spgistFlagTable) {
+                if (spgistSection->flags & entry.mask) {
+                    rc = strcat_s(flagString, sizeof(flagString), entry.name);
+                    securec_check(rc, "\0", "\0");
+                    rc = strcat_s(flagString, sizeof(flagString), "|");
+                    securec_check(rc, "\0", "\0");
+                }
+            }
+
+            if (strlen(flagString)) {
+                flagString[strlen(flagString) - 1] = '\0';
+            }
+            printf(" SPGIST Index Section:\n"
+                   "  Flags: 0x%08x (%s)\n"
+                   "  nRedirection: %d\n"
+                   "  nPlaceholder: %d\n\n",
+                   spgistSection->flags, flagString, spgistSection->nRedirection, spgistSection->nPlaceholder);
+            break;
+        }
+            /* No idea what type of special section this is */
+        default:
+            printf(" Unknown special section type. Type: <%u>.\n", g_specialType);
+            g_exitCode = 1;
+            break;
+    }
+
+    /* Dump the formatted contents of the special section */
+    if (g_blockOptions & BLOCK_FORMAT) {
+        if (g_specialType == SPEC_SECT_ERROR_BOUNDARY) {
+            printf(" Error: Special section points off page."
+                   " Unable to dump contents.\n");
+
+            g_exitCode = 1;
+        } else {
+            FormatBinary(buffer, specialSize, specialOffset);
+        }
+    }
+}
+
+/*	For each block, dump out formatted header and content information */
+static void FormatBlock(unsigned int blockOptions, unsigned int controlOptions, char *buffer, BlockNumber currentBlock,
+                        unsigned int blockSize, bool isToast, Oid toastOid, unsigned int toastExternalSize,
+                        char *toastValue, unsigned int *toastRead)
+{
+    Page page = (Page)buffer;
+    const char *indent = isToast ? "\t" : "";
+
+    g_pageOffset = blockSize * currentBlock;
+    g_specialType = GetSpecialSectionType(buffer, page);
+
+    if (!isToast || g_verbose) {
+        printf("\n%sBlock %4u **%s***************************************\n", indent, currentBlock,
+               (g_bytesToFormat == blockSize) ? "***************" : " PARTIAL BLOCK ");
+    }
+
+    /* Either dump out the entire block in hex+acsii fashion or
+     * interpret the data based on block structure */
+    if (blockOptions & BLOCK_NO_INTR) {
+        FormatBinary(buffer, g_bytesToFormat, 0);
+    } else {
+        int rc;
+
+        /* Every block contains a header, items and possibly a special
+         * section.  Beware of partial block reads though */
+        if (g_isUHeap) {
+            rc = FormatUHeapHeader(buffer, page, currentBlock, isToast);
+        } else {
+            rc = FormatHeader(buffer, page, currentBlock, isToast);
+        }
+
+        /* If we didn't encounter a partial read in the header, carry on... */
+        if (rc != EOF_ENCOUNTERED) {
+            if (g_isUHeap) {
+                FormatUHeapItemBlock(buffer, page, isToast, toastOid, toastExternalSize, toastValue, toastRead);
+                if (g_specialType != SPEC_SECT_NONE) {
+                    FormatUHeapSpecial(buffer);
+                }
+            } else {
+                FormatItemBlock(buffer, page, isToast, toastOid, toastExternalSize, toastValue, toastRead);
+                if (g_specialType != SPEC_SECT_NONE) {
+                    FormatSpecial(buffer);
+                }
+            }
+        }
+    }
+}
+
+/*	Dump out the content of the PG control file */
+static void FormatControl(char *buffer)
+{
+    unsigned int localPgVersion = 0;
+    unsigned int controlFileSize = 0;
+    time_t cdTime;
+    time_t cpTime;
+
+    printf("\n<pg_control Contents> *********************************************\n\n");
+
+    /* Check the version */
+    if (g_bytesToFormat >= offsetof(ControlFileData, catalog_version_no)) {
+        localPgVersion = ((ControlFileData *)buffer)->pg_control_version;
+    }
+
+    try {
+        controlFileSize = sizeof(ControlFileData);
+    } catch (const std::exception &e) {
+        printf("gs_filedump: pg_control version %u not supported.\n", localPgVersion);
+        return;
+    }
+
+    /* Interpret the control file if it's all there */
+    if (g_bytesToFormat >= controlFileSize) {
+        ControlFileData *controlData = (ControlFileData *)buffer;
+        CheckPoint *checkPoint = &(controlData->checkPointCopy);
+        pg_crc32 crcLocal;
+
+        /* Compute a local copy of the CRC to verify the one on disk */
+        INIT_CRC32C(crcLocal);
+        COMP_CRC32C(crcLocal, buffer, offsetof(ControlFileData, crc));
+        FIN_CRC32C(crcLocal);
+
+        /* Grab a readable version of the database state */
+        const char* dbState = "UNKNOWN";
+        for (const auto& entry : dbStateTable) {
+            if (controlData->state == entry.state) {
+                dbState = entry.name;
+                break;
+            }
+        }
+
+        /* convert timestamps to system's time_t width */
+        cdTime = controlData->time;
+        cpTime = checkPoint->time;
+
+        printf("                          CRC: %s\n"
+               "           pg_control Version: %u%s\n"
+               "              Catalog Version: %u\n"
+               "   Database system Identifier: " UINT64_FORMAT "\n"
+               "       Database cluster State: %s\n"
+               "     pg_control last modifyed: %s"
+               "       Last Checkpoint Record: Log File (%u) Offset (0x%08x)\n"
+               "   Previous Checkpoint Record: Log File (%u) Offset (0x%08x)\n"
+               "  Last Checkpoint Record Redo: Log File (%u) Offset (0x%08x)\n"
+               "          |-       TimeLineID: %u\n"
+               "          |- full_path_writes: %s\n"
+               "          |-         Next XID: %lu\n"
+               "          |-         Next OID: %u\n"
+               "          |- Next MultiXactId: %lu\n"
+               "          |- Next MultiOffset: %lu\n"
+               "          |-        oldestXid: %lu\n"
+               "          |-   oldestXid's DB: %u\n"
+               "          |-  oldestActiveXid: %lu\n"
+               "          |-       remove_seg: %X/%lu\n"
+               "    Time of latest checkpoint: %s"
+
+               "       Minimum Recovery Point: Log File (%u) Offset (0x%08x)\n"
+               "        Backup start location: %X/%X\n"
+               "          Backup end location: %X/%X\n"
+               "End-of-backup record required: %s\n"
+               " Current Setting:\n"
+               "                    wal_level: %s\n"
+               "              max_connections: %u\n"
+               "           max_prepared_xacts: %u\n"
+               "           max_locks_per_xact: %u\n"
+
+               "       Maximum Data Alignment: %u\n"
+               "        Floating-Point Sample: %.7g%s\n"
+               "          Database Block Size: %u\n"
+               "           Blocks Per Segment: %u\n"
+               "              XLOG Block Size: %u\n"
+               "            XLOG Segment Size: %u\n"
+               "Maximum length of identifiers: %u\n"
+               "  Maximum columns in an index: %u\n"
+               "Maximum size of a TOAST chunk: %u\n"
+               "       Date/time type storage: %s\n"
+               "      Float4 argument passing: %s\n"
+               "      Float8 argument passing: %s\n"
+               "     Database system TimeLine: %u\n",
+               EQ_CRC32C(crcLocal, controlData->crc) ? "Correct" : "Not Correct", controlData->pg_control_version,
+               (controlData->pg_control_version == PG_CONTROL_VERSION ? "" : " (Not Correct!)"),
+               controlData->catalog_version_no, controlData->system_identifier, dbState, ctime(&(cdTime)),
+               (uint32)(controlData->checkPoint >> 32), (uint32)controlData->checkPoint,
+               (uint32)(controlData->prevCheckPoint >> 32), (uint32)controlData->prevCheckPoint,
+               (uint32)(checkPoint->redo >> 32), (uint32)checkPoint->redo, checkPoint->ThisTimeLineID,
+               checkPoint->fullPageWrites ? _("on") : _("off"), checkPoint->nextXid, checkPoint->nextOid,
+               checkPoint->nextMulti, checkPoint->nextMultiOffset, checkPoint->oldestXid, checkPoint->oldestXidDB,
+               checkPoint->oldestActiveXid, (uint32)(checkPoint->remove_seg >> 32), checkPoint->remove_seg,
+               ctime(&cpTime), (uint32)(controlData->minRecoveryPoint >> 32), (uint32)controlData->minRecoveryPoint,
+               (uint32)(controlData->backupStartPoint >> 32), (uint32)controlData->backupStartPoint,
+               (uint32)(controlData->backupEndPoint >> 32), (uint32)controlData->backupEndPoint,
+               controlData->backupEndRequired ? _("yes") : _("no"),
+
+               wal_level_str((WalLevel)controlData->wal_level), controlData->MaxConnections,
+               controlData->max_prepared_xacts, controlData->max_locks_per_xact,
+
+               controlData->maxAlign, controlData->floatFormat,
+               (controlData->floatFormat == FLOATFORMAT_VALUE ? "" : " (Not Correct!)"), controlData->blcksz,
+               controlData->relseg_size, controlData->xlog_blcksz, controlData->xlog_seg_size, controlData->nameDataLen,
+               controlData->indexMaxKeys, controlData->toast_max_chunk_size,
+               (controlData->enableIntTimes ? _("64-bit integers") : _("floating-point numbers")),
+               (controlData->float4ByVal ? _("by value") : _("by reference")),
+               (controlData->float8ByVal ? _("by value") : _("by reference")), controlData->timeline);
+    } else {
+        printf(" Error: pg_control file size incorrect.\n"
+               "        Size: Correct <%u>  Received <%u>.\n\n",
+               controlFileSize, g_bytesToFormat);
+
+        /* If we have an error, force a formatted dump so we can see
+         * where things are going wrong */
+        g_controlOptions |= CONTROL_FORMAT;
+
+        g_exitCode = 1;
+    }
+
+    /* Dump hex and ascii representation of data */
+    if (g_controlOptions & CONTROL_FORMAT) {
+        printf("<pg_control Formatted Dump> *****************"
+               "**********************\n\n");
+        FormatBinary(buffer, g_bytesToFormat, 0);
     }
 }
 

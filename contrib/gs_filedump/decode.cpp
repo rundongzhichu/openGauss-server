@@ -11,7 +11,7 @@
 static bool g_itemIsNull;
 static unsigned int g_itemSize;
 static int g_ignoreLocation = -1;
-static int DelEndZero(int num);
+static void TrimTrailingChars(char* str);
 
 static int ReadStringFromToast(const char *buffer, unsigned int buffSize, unsigned int *outSize,
                                int (*parseValue)(const char *, int));
@@ -112,13 +112,21 @@ void ExceptionalCondition(const char *conditionName, const char *errorType, cons
     exit(1);
 }
 
-static int DelEndZero(int num)
+static void TrimTrailingChars(char* str)
 {
-    int numRes = num;
-    while (numRes % DECIMAL_BASE == 0) {
-        numRes /= DECIMAL_BASE;
+    if (str == nullptr) {
+        return;
     }
-    return numRes;
+
+    size_t len = strlen(str);
+    while (len > 0 && str[len - 1] == '0') {
+        --len;
+    }
+    str[len] = '\0';
+
+    if (str[strlen(str) - 1] == '.') {
+        str[strlen(str) - 1] = '\0';
+    }
 }
 
 /* Append given string to current COPY line */
@@ -177,9 +185,10 @@ static int HandleSpecialNumeric(struct NumericData *numericData)
     return RETURN_SUCCESS;
 }
 
-static void AppendIntegerPart(NumericDigit *digitsArray, int numberOfDigits, int weight, char **currentPosition)
+static void AppendIntegerPart(NumericDigit *digitsArray, int numberOfDigits,
+                              int weight, int &digitIndex, char **currentPosition)
 {
-    for (int digitIndex = 0; digitIndex <= weight; digitIndex++) {
+    for (digitIndex = 0; digitIndex <= weight; digitIndex++) {
         NumericDigit digit = (digitIndex < numberOfDigits) ? digitsArray[digitIndex] : 0;
 
         bool shouldOutputDigit = (digitIndex > 0);
@@ -208,7 +217,8 @@ static void AppendIntegerPart(NumericDigit *digitsArray, int numberOfDigits, int
     }
 }
 
-static void AppendDecimalPart(NumericDigit *digitsArray, int numberOfDigits, int decimalScale, char **currentPosition)
+static void AppendDecimalPart(NumericDigit *digitsArray, int numberOfDigits,
+                              int decimalScale, int &digitIndex, char **currentPosition)
 {
     if (decimalScale <= 0) {
         return;
@@ -216,9 +226,8 @@ static void AppendDecimalPart(NumericDigit *digitsArray, int numberOfDigits, int
 
     *(*currentPosition)++ = '.';
     char *endPosition = (*currentPosition) + decimalScale;
-
-    for (int index = 0; index < decimalScale; index += DEC_DIGITS) {
-        NumericDigit digit = (index < numberOfDigits) ? digitsArray[index] : 0;
+    for (int index = 0; index < decimalScale; digitIndex++, index += DEC_DIGITS) {
+        NumericDigit digit = (digitIndex >= 0 && digitIndex < numberOfDigits) ? digitsArray[digitIndex] : 0;
         NumericDigit firstDigit = digit / DECIMAL_THOUSAND;
         digit -= firstDigit * DECIMAL_THOUSAND;
         *(*currentPosition)++ = firstDigit + '0';
@@ -259,8 +268,17 @@ static int BuildNumericString(struct NumericData *numericData, int numericSize)
         *currentPosition++ = '-';
     }
 
-    AppendIntegerPart(digitsArray, numberOfDigits, weight, &currentPosition);
-    AppendDecimalPart(digitsArray, numberOfDigits, decimalScale, &currentPosition);
+    int digitIndex;
+
+    if (weight < 0) {
+        digitIndex = weight + 1;
+        *currentPosition++ = '0';
+    } else {
+        AppendIntegerPart(digitsArray, numberOfDigits, weight, digitIndex, &currentPosition);
+    }
+    if (decimalScale > 0) {
+        AppendDecimalPart(digitsArray, numberOfDigits, decimalScale, digitIndex,  &currentPosition);
+    }
 
     *currentPosition = '\0';
     CopyAppend(stringRepresentation);
@@ -485,60 +503,51 @@ static int DecodeBigint(const char *buffer, unsigned int buffSize, unsigned int 
     return DecodeIntegral<int64>(buffer, buffSize, outSize, INT64_FORMAT);
 }
 
-static void FormatTime(int64 timestamp_sec, int64 timestamp)
+static void FormatTime(int64 timestampSec, int64 timestamp, char* copyTime, size_t bufferSize)
 {
-    if (timestamp % MICROSECONDS_PER_SECOND != 0) {
-        CopyAppendFmt("%02ld:%02ld:%02ld.%ld",
-                      timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
-                      (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR,
-                      timestamp_sec % SECS_PER_MINUTE,
-                      DelEndZero(timestamp % MICROSECONDS_PER_SECOND));
-    } else {
-        CopyAppendFmt("%02ld:%02ld:%02ld",
-                      timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
-                      (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR,
-                      timestamp_sec % SECS_PER_MINUTE);
+    int res = snprintf_s(copyTime, bufferSize, bufferSize - 1, "%02ld:%02ld:%02ld.%06ld",
+                         timestampSec / SECS_PER_MINUTE / MINS_PER_HOUR,
+                         (timestampSec / SECS_PER_MINUTE) % MINS_PER_HOUR,
+                         timestampSec % SECS_PER_MINUTE,
+                         timestamp % MICROSECONDS_PER_SECOND);
+    if (res == 0) {
+        fprintf(stderr, "Failed to format time string.\n");
     }
+
+    TrimTrailingChars(copyTime);
 }
 
-static void FormatTimeWithTimezone(int64 timestamp_sec, int32 tz_min, int64 timestamp)
+static void FormatTimeWithTimezone(int64 timestampSec, int32 tzSec, int64 timestamp,
+                                   char* copyTimeZone, size_t bufferSize)
 {
-    if (timestamp % MICROSECONDS_PER_SECOND != 0) {
-        if (tz_min % SECS_PER_MINUTE != 0) {
-            CopyAppendFmt("%02ld:%02ld:%02ld.%ld%c%02d:%02d",
-                          timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
-                          (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR,
-                          timestamp_sec % SECS_PER_MINUTE,
-                          DelEndZero(timestamp % MICROSECONDS_PER_SECOND),
-                          (tz_min >= 0 ? '+' : '-'),
-                          abs(tz_min / MINS_PER_HOUR),
-                          abs(tz_min % MINS_PER_HOUR));
-        } else {
-            CopyAppendFmt("%02ld:%02ld:%02ld.%ld%c%02d",
-                          timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
-                          (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR,
-                          timestamp_sec % SECS_PER_MINUTE,
-                          DelEndZero(timestamp % MICROSECONDS_PER_SECOND),
-                          (tz_min >= 0 ? '+' : '-'),
-                          abs(tz_min / MINS_PER_HOUR));
-        }
+    int32 tzMin = -(tzSec / SECS_PER_MINUTE);
+    tzSec = abs(tzSec % SECS_PER_MINUTE);
+    char copyTime[COPY_BUFFER_SIZE];
+    FormatTime(timestampSec, timestamp, copyTime, COPY_BUFFER_SIZE);
+    int res = 0;
+    if (tzSec > 0) {
+        res = snprintf_s(copyTimeZone, bufferSize, bufferSize -1, "%s%c%02d:%02d:%02d",
+                         copyTime,
+                         (tzMin >= 0 ? '+' : '-'),
+                         abs(tzMin / MINS_PER_HOUR),
+                         abs(tzMin % MINS_PER_HOUR),
+                         tzSec);
     } else {
-        if (tz_min % SECS_PER_MINUTE != 0) {
-            CopyAppendFmt("%02ld:%02ld:%02ld%c%02d:%02d",
-                          timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
-                          (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR,
-                          timestamp_sec % SECS_PER_MINUTE,
-                          (tz_min >= 0 ? '+' : '-'),
-                          abs(tz_min / MINS_PER_HOUR),
-                          abs(tz_min % MINS_PER_HOUR));
+        if (tzMin % MINS_PER_HOUR != 0) {
+            res = snprintf_s(copyTimeZone, bufferSize, bufferSize -1, "%s%c%02d:%02d",
+                             copyTime,
+                             (tzMin >= 0 ? '+' : '-'),
+                             abs(tzMin / MINS_PER_HOUR),
+                             abs(tzMin % MINS_PER_HOUR));
         } else {
-            CopyAppendFmt("%02ld:%02ld:%02ld%c%02d",
-                          timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
-                          (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR,
-                          timestamp_sec % SECS_PER_MINUTE,
-                          (tz_min >= 0 ? '+' : '-'),
-                          abs(tz_min / MINS_PER_HOUR));
+            res = snprintf_s(copyTimeZone, bufferSize, bufferSize -1, "%s%c%02d",
+                             copyTime,
+                             (tzMin >= 0 ? '+' : '-'),
+                             abs(tzMin / MINS_PER_HOUR));
         }
+    }
+    if (res < 0) {
+        fprintf(stderr, "Failed to format time with zone.\n");
     }
 }
 
@@ -552,7 +561,6 @@ static int DecodeTimeTemplate(const char *buffer, unsigned int buffSize, unsigne
     int64 timestamp;
     int64 timestamp_sec;
     int32 tz_sec = 0;
-    int32 tz_min = 0;
 
     if (!g_isUHeap) {
         const char *newBuffer = reinterpret_cast<const char *>(LONGALIGN(buffer));
@@ -576,7 +584,6 @@ static int DecodeTimeTemplate(const char *buffer, unsigned int buffSize, unsigne
         CHECK_BUFFER_SIZE(buffSize, (sizeof(int64) + sizeof(int32)));
         timestamp = *(int64 *)buffer;
         tz_sec = *(int32 *)(buffer + sizeof(int64));
-        tz_min = -(tz_sec / 60);
         *outSize = sizeof(int64) + sizeof(int32) + delta;
     } else {
         CHECK_BUFFER_SIZE(buffSize, sizeof(int64));
@@ -587,11 +594,13 @@ static int DecodeTimeTemplate(const char *buffer, unsigned int buffSize, unsigne
     timestamp_sec = timestamp / MICROSECONDS_PER_SECOND;
 
     if (!g_itemIsNull) {
+        char copyTime[COPY_BUFFER_SIZE];
         if (WITH_TIMEZONE) {
-            FormatTimeWithTimezone(timestamp_sec, tz_min, timestamp);
+            FormatTimeWithTimezone(timestamp_sec, tz_sec, timestamp, copyTime, COPY_BUFFER_SIZE);
         } else {
-            FormatTime(timestamp_sec, timestamp);
+            FormatTime(timestamp_sec, timestamp, copyTime, COPY_BUFFER_SIZE);
         }
+        CopyAppend(copyTime);
     }
     return static_cast<int>(DecodeResult::DECODE_SUCCESS);
 }
@@ -692,17 +701,19 @@ static int DecodeTimestampInternal(const char *buffer, unsigned int buffSize, un
     timestamp_sec = timestamp / MICROSECONDS_PER_SECOND;
 
     if (!g_itemIsNull) {
-        if (timestamp % MICROSECONDS_PER_SECOND != 0) {
-            CopyAppendFmt("%04d-%02d-%02d %02ld:%02ld:%02ld.%ld%s%s",
-                (year <= 0) ? -year + 1 : year, month, day, timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
-                (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR, timestamp_sec % SECS_PER_MINUTE,
-                DelEndZero(timestamp % MICROSECONDS_PER_SECOND), withTimezone ? "+00" : "", (year <= 0) ? " BC" : "");
-        } else {
-            CopyAppendFmt("%04d-%02d-%02d %02ld:%02ld:%02ld%s%s",
-                (year <= 0) ? -year + 1 : year, month, day, timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
-                (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR, timestamp_sec % SECS_PER_MINUTE,
-                withTimezone ? "+00" : "", (year <= 0) ? " BC" : "");
+        char copyTimestamp[COPY_BUFFER_SIZE];
+        int res = snprintf_s(copyTimestamp, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE - 1,
+            "%04d-%02d-%02d %02ld:%02ld:%02ld.%06ld",
+            (year <= 0) ? -year + 1 : year, month, day, timestamp_sec / SECS_PER_MINUTE / MINS_PER_HOUR,
+            (timestamp_sec / SECS_PER_MINUTE) % MINS_PER_HOUR, timestamp_sec % SECS_PER_MINUTE,
+            timestamp % MICROSECONDS_PER_SECOND);
+        if (res < 0) {
+            fprintf(stderr, "Failed to format timestamp.\n");
         }
+
+        TrimTrailingChars(copyTimestamp);
+        
+        CopyAppendFmt("%s%s%s", copyTimestamp, withTimezone ? "+00" : "", (year <= 0) ? " BC" : "");
     }
     return static_cast<int>(DecodeResult::DECODE_SUCCESS);
 }
@@ -740,9 +751,12 @@ static int DecodeFloat(const char *buffer, unsigned int buffSize, unsigned int *
     CHECK_BUFFER_SIZE(buffSize, sizeof(T));
 
     if (!g_itemIsNull) {
-        char copyFormatBuff[512];
-        snprintf_s(copyFormatBuff, sizeof(copyFormatBuff), sizeof(copyFormatBuff) - 1, "%.*g",
-            static_cast<int>(sizeof(T) * 2), *reinterpret_cast<const T*>(buffer));
+        char copyFormatBuff[COPY_BUFFER_SIZE];
+        int res = snprintf_s(copyFormatBuff, COPY_BUFFER_SIZE, COPY_BUFFER_SIZE - 1, "%.*g",
+                             static_cast<int>(sizeof(T) * 2), *reinterpret_cast<const T*>(buffer));
+        if (res < 0) {
+            fprintf(stderr, "Failed to format time float.\n");
+        }
         if (pg_strncasecmp(copyFormatBuff, "inf", strlen("inf")) == 0) {
             CopyAppend("Infinity");
         } else if (pg_strncasecmp(copyFormatBuff, "-inf", strlen("-inf")) == 0) {

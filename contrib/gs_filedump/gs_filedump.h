@@ -146,6 +146,16 @@ using OptionReturnCodes = enum {
     OPT_RC_COPYRIGHT  /* Copyright should be displayed */
 };
 
+struct DbStateMapping {
+    int state;
+    const char* name;
+};
+
+struct FlagMapping {
+    uint32 mask;
+    const char* name;
+};
+
 /* Simple macro to check for duplicate options and then set
  * an option flag for later consumption */
 #define SET_OPTION(_x, _y, _z)  \
