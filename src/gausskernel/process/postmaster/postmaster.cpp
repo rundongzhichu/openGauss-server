@@ -6403,6 +6403,14 @@ static void pmdie(SIGNAL_ARGS)
                 ExitPostmaster(0);
             }
 
+            smb_recovery::KillSMBWriterThreads();
+            if (g_instance.smb_cxt.SMBAlyPID != 0) {
+                signal_child(g_instance.smb_cxt.SMBAlyPID, SIGTERM);
+            }
+            if (g_instance.smb_cxt.SMBAlyAuxPID != 0) {
+                signal_child(g_instance.smb_cxt.SMBAlyAuxPID, SIGTERM);
+            }
+
             if (g_instance.pid_cxt.StartupPID != 0) {
                 ereport(LOG, (errmsg("send to startup shutdown request")));
                 signal_child(g_instance.pid_cxt.StartupPID, SIGTERM);
@@ -6644,14 +6652,6 @@ static void pmdie(SIGNAL_ARGS)
              * PostmasterStateMachine will take the next step.
              */
             PostmasterStateMachine();
-            if (g_instance.smb_cxt.SMBWriterPID != 0) {
-                signal_child(g_instance.smb_cxt.SMBWriterPID, SIGTERM);
-                for (int i = 0; i < smb_recovery::SMB_BUF_MGR_NUM - 1; i++) {
-                    if (g_instance.smb_cxt.SMBWriterAuxPID[i] != 0) {
-                        signal_child(g_instance.smb_cxt.SMBWriterAuxPID[i], SIGTERM);
-                    }
-                }
-            }
             break;
 
         case SIGQUIT:
@@ -6852,6 +6852,8 @@ static void ProcessDemoteRequest(void)
 
                 if (g_instance.pid_cxt.SqlLimitPID != 0)
                     signal_child(g_instance.pid_cxt.SqlLimitPID, SIGTERM);
+
+                smb_recovery::KillSMBWriterThreads();
 
 #ifdef ENABLE_HTAP
                 if (g_instance.pid_cxt.IMCStoreVacuumPID != 0)
@@ -7084,6 +7086,8 @@ dms_demote:
                     if (g_instance.pid_cxt.WalWriterAuxiliaryPID != 0)
                         signal_child(g_instance.pid_cxt.WalWriterAuxiliaryPID, SIGTERM);
 
+                    smb_recovery::KillSMBWriterThreads();
+
 #ifdef ENABLE_HTAP
                     if (g_instance.pid_cxt.IMCStoreVacuumPID != 0){
                         signal_child(g_instance.pid_cxt.IMCStoreVacuumPID, SIGTERM);
@@ -7195,14 +7199,6 @@ dms_demote:
      * PostmasterStateMachine will take the next step.
      */
     PostmasterStateMachine();
-    if (g_instance.smb_cxt.SMBWriterPID != 0) {
-        signal_child(g_instance.smb_cxt.SMBWriterPID, SIGTERM);
-        for (int i = 0; i < smb_recovery::SMB_BUF_MGR_NUM - 1; i++) {
-            if (g_instance.smb_cxt.SMBWriterAuxPID[i] != 0) {
-                signal_child(g_instance.smb_cxt.SMBWriterAuxPID[i], SIGTERM);
-            }
-        }
-    }
 }
 
 /*
