@@ -32,6 +32,8 @@ const int HALF_NBASE = 5000;
 const int DEC_DIGITS = 4;       /* decimal digits per NBASE digit */
 const int MUL_GUARD_DIGITS = 2; /* these are measured in NBASE digits */
 const int DIV_GUARD_DIGITS = 4;
+const size_t COPY_BUFFER_SIZE = 512; /* buffer size for copying */
+
 
 using NumericDigit = int16;
 
