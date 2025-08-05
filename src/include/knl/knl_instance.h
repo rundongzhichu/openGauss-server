@@ -1702,6 +1702,7 @@ typedef struct knl_instance_context {
     knl_g_datadir_context datadir_cxt;
     knl_g_dms_context dms_cxt;
     bool pq_inited;
+    bool diskann_pq_inited;
 #ifdef USE_SPQ
     knl_g_spq_context spq_cxt;
 #endif
