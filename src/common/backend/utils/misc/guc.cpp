@@ -12414,12 +12414,12 @@ static void assign_shared_preload_libraries(const char* newval, void* extra)
     int rcs = 0;
 
     if (newval == NULL || strlen(newval) == 0) {
-        new_value = pstrdup("security_plugin");
+        new_value = guc_strdup(ERROR, "security_plugin");
     } else if (strstr(newval, "security_plugin") != NULL) {
-        new_value = pstrdup(newval);
+        new_value = guc_strdup(ERROR, newval);
     } else {
         size_t total_len = strlen(newval) + strlen(",security_plugin") + 1;
-        new_value = (char*)palloc(total_len);
+        new_value = (char*)guc_malloc(ERROR, total_len);
         rcs = snprintf_s(new_value, total_len, total_len - 1, "%s,security_plugin", newval);
         securec_check_ss(rcs, "\0", "\0");
     }
