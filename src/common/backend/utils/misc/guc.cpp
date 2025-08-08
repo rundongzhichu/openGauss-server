@@ -581,6 +581,7 @@ static void ConfFileNameCat(char* ConfFileName, char* ConfTmpFileName,
 static void WriteAlterSystemSetGucFile(char* ConfFileName, char** opt_lines, ConfFileLock* filelock);
 static char** LockAndReadConfFile(char* ConfFileName, char* ConfTmpFileName, char* ConfLockFileName,
     ConfFileLock* filelock);
+static bool CheckUnsupportGucContext(struct config_generic* record);
 #endif
 inline void scape_space(char **pp)
 {
@@ -9126,8 +9127,7 @@ static void CheckAndGetAlterSystemSetParam(AlterSystemStmt* altersysstmt,
                 (errcode(ERRCODE_UNDEFINED_OBJECT),
                  errmsg("unrecognized configuration parameter \"%s\"", name)));
 
-    if ((record->context != PGC_POSTMASTER && record->context != PGC_SIGHUP && record->context != PGC_BACKEND) ||
-        record->flags & GUC_DISALLOW_IN_FILE)
+    if (CheckUnsupportGucContext(record))
         ereport(ERROR,
             (errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),
              errmsg("unsupport parameter: %s\n"
@@ -9143,6 +9143,33 @@ static void CheckAndGetAlterSystemSetParam(AlterSystemStmt* altersysstmt,
     *outer_name = name;
     *outer_value = value;
     *outer_record = record;
+}
+
+static void PrintNoticeMsg(GucContext context)
+{
+    static char* gucList[] = { "INTERNAL", "POSTMASTER", "SIGHUP", "BACKEND", "SUSET", "USERSET" };
+    static int listSize = sizeof(gucList) / sizeof(gucList[0]);
+    int index = context - PGC_INTERNAL;
+    if (index >= listSize) {
+        return;
+    }
+    ereport(NOTICE,(errmsg("%s level parameter change may cause guc config changes in other sessions", gucList[index])));
+}
+
+static bool CheckUnsupportGucContext(struct config_generic* record)
+{
+    if (DB_IS_CMPT(B_FORMAT) && record->group == CUSTOM_OPTIONS && record->context != PGC_INTERNAL &&
+        (record->flags & GUC_DISALLOW_IN_FILE) == 0) {
+        if ((record->context != PGC_SIGHUP)) {
+            PrintNoticeMsg(record->context);
+        }
+        return false;
+    }
+    if ((record->context != PGC_POSTMASTER && record->context != PGC_SIGHUP && record->context != PGC_BACKEND) ||
+        record->flags & GUC_DISALLOW_IN_FILE) {
+        return true;
+    }
+    return false;
 }
 
 /*
