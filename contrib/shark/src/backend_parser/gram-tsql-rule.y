@@ -2083,6 +2083,35 @@ direct_label_keyword: ABORT_P
             | TIMEZONE_MINUTE_P
             | TINYINT
             | TSQL_TOP
+			| TSQL_QUARTER
+			| TSQL_YYYY
+			| TSQL_YY
+			| TSQL_Q
+			| TSQL_QQ
+			| TSQL_MM
+			| TSQL_M
+			| TSQL_DAYOFYEAR
+			| TSQL_DY
+			| TSQL_Y
+			| TSQL_WEEK
+			| TSQL_WK
+			| TSQL_WW
+			| TSQL_WEEKDAY
+			| TSQL_DW
+			| TSQL_W
+			| TSQL_DD
+			| TSQL_D
+			| TSQL_HH
+			| TSQL_MI
+			| TSQL_N
+			| TSQL_SS
+			| TSQL_S
+			| TSQL_MILLISECOND
+			| TSQL_MS
+			| TSQL_MICROSECOND
+			| TSQL_MCS
+			| TSQL_NANOSECOND
+			| TSQL_NS
             | TRAILING
 			| TRAN
             | TRANSACTION
