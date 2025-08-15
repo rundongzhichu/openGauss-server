@@ -2868,7 +2868,7 @@ tsql_InsertStmt: opt_with_clause INSERT hint_string INTO insert_target tsql_opt_
 		;
 
 /* table hint for delete statement */
-delete_relation_expr_opt_alias_with_hint: delete_relation_expr_opt_alias tsql_table_hint_expr_with { $$ = $1; }
+delete_relation_expr_opt_alias_with_hint: delete_relation_expr_opt_alias tsql_table_hint_expr_with { $$ = (RangeVar*)$1; }
 			;
 
 relation_expr_opt_alias_list: 
