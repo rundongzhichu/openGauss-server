@@ -656,6 +656,7 @@ other			.
 							IsTranscationTokens(yytext, "work") ||
                             IsTranscationTokens(yytext, "isolation") ||
                             IsTranscationTokens(yytext, "read") ||
+                            IsTranscationTokens(yytext, "try") ||
                             IsTranscationTokens(yytext, "deferrable") ||
                             IsTranscationTokens(yytext, "not") ||
 							strncasecmp(yytext, ";", strlen(";")) == 0)
