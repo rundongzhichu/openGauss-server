@@ -422,7 +422,8 @@ static const struct behavior_compat_entry behavior_compat_options[OPT_MAX] = {
     {"float_as_numeric", OPT_FLOAT_AS_NUMERIC},
     {"disable_record_type_in_dml", OPT_DISABLE_RECORD_TYPE_IN_DML},
     {"accept_float_str_as_int", OPT_ACCEPT_FLOAT_STR_AS_INT},
-    {"ignore_unused_index_check_on_dml", OPT_IGNORE_UNUSED_INDEX_CHECK_ON_DML}
+    {"ignore_unused_index_check_on_dml", OPT_IGNORE_UNUSED_INDEX_CHECK_ON_DML},
+    {"compatible_a_db_array", OPT_COMPATIBLE_A_DB_ARRAY}
 };
 
 // increase SQL_IGNORE_STRATEGY_NUM if we need more strategy
