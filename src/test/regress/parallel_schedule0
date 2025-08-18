@@ -787,7 +787,7 @@ test: select_where_func
 test: arrayinterface_single
 test: plpgsql_table_opengauss  
 test: plpgsql_assign_value_to_array_attribute
-test: plpgsql_array_of_record
+test: plpgsql_array_of_record plpgsql_predefined_types
 #test: plpgsql_nest_compile
 test: arrayinterface_ted
 test: function_default_test plpgsql_inout_param record_slow_sql_in_proc

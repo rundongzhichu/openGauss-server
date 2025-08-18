@@ -119,6 +119,7 @@ static void AddIndexColumnForCbi(IndexStmt* stmt);
 static void CheckIndexParamsNumber(IndexStmt* stmt);
 static bool CheckIdxParamsOwnPartKey(Relation rel, const List* indexParams);
 static bool CheckWhetherForbiddenFunctionalIdx(Oid relationId, Oid namespaceId, List* indexParams);
+static void CheckColumnTypeSupportsIndex(Oid relId, List* indexParams);
 
 struct ReindexIndexCallbackState {
     bool concurrent;        /* flag from statement */
@@ -911,6 +912,8 @@ ObjectAddress DefineIndex(Oid relationId, IndexStmt* stmt, Oid indexRelationId, 
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("index of ledger user talbe can not contain \"hash\" column.")));
     }
+
+    CheckColumnTypeSupportsIndex(relationId, stmt->indexParams);
 
     SetPartionIndexType(stmt, rel, is_alter_table);
 
@@ -5636,6 +5639,40 @@ CheckWhetherForbiddenFunctionalIdx(Oid relationId, Oid namespaceId, List* indexP
     return false;
 }
 
+static void CheckColumnTypeSupportsIndex(Oid relId, List* indexParams)
+{
+    ListCell* lc = NULL;
+    foreach (lc, indexParams) {
+        IndexElem* elem = (IndexElem*)lfirst(lc);
+        if (elem->name == NULL) {
+            continue;
+        }
+        HeapTuple atttuple = SearchSysCacheAttName(relId, elem->name);
+        Form_pg_attribute attform;
+        Oid atttype;
+        if (HeapTupleIsValid(atttuple)) {
+            attform = (Form_pg_attribute)GETSTRUCT(atttuple);
+            atttype = attform->atttypid;
+            switch (atttype) {
+                case NATURALOID:
+                case NATURALNOID:
+                case POSITIVEOID:
+                case POSITIVENOID:
+                case SIGNTYPEOID:
+                case SIMPLE_INTEGER_OID: {
+                    ereport(ERROR,
+                        (errmodule(MOD_EXECUTOR),
+                            errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                            errmsg("not supported to create index on a column of type %s.",
+                                format_type_be(atttype))));
+                }
+                default:
+                    break;
+            }
+            ReleaseSysCache(atttuple);
+        }
+    }
+}
 
 #ifdef ENABLE_MULTIPLE_NODES
 /*
