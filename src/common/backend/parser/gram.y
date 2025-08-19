@@ -57,6 +57,7 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_proc_ext.h"
 #include "catalog/pg_type.h"
 #include "catalog/gs_package.h"
 #include "catalog/pg_am.h"
@@ -1006,7 +1007,7 @@ static Alias* generate_alias(Alias* clone_target, const char* default_alias_name
 
 	RANDOMIZED RANGE RATIO RAW READ REAL REASSIGN REBUILD RECHECK RECURSIVE RECYCLEBIN REDISANYVALUE REF REFERENCES REFRESH REINDEX REJECT_P
 	RELATIVE_P RELEASE RELOPTIONS REMOTE_P REMOVE RENAME REPEAT REPEATABLE REPLACE REPLICA
-	RESET RESIZE RESOURCE RESPECT_P RESTART RESTRICT RETURN RETURNED_SQLSTATE RETURNING RETURNS REUSE REVOKE RIGHT ROLE ROLES ROLLBACK ROLLUP ROTATE
+	RESET RESIZE RESOURCE RESPECT_P RESTART RESTRICT RESULT_CACHE RETURN RETURNED_SQLSTATE RETURNING RETURNS REUSE REVOKE RIGHT ROLE ROLES ROLLBACK ROLLUP ROTATE
 	ROTATION ROW ROW_COUNT ROWNUM ROWS ROWTYPE_P RULE
 
 	SAMPLE SAVEPOINT SCHEDULE SCHEMA SCHEMA_NAME SCROLL SEARCH SECOND_P SECURITY SELECT SEPARATOR_P SEQUENCE SEQUENCES SHARE_MEMORY
@@ -16391,6 +16392,7 @@ CreateFunctionStmt:
 					n->options = $9;
 					n->withClause = $10;
 					n->isProcedure = false;
+					check_func_can_cache_result(n, false);
 					$$ = (Node *)n;
 				}
 			| CREATE opt_or_replace definer_user FUNCTION func_name_opt_arg proc_args
@@ -16412,6 +16414,7 @@ CreateFunctionStmt:
 					n->options = $12;
 					n->withClause = $13;
 					n->isProcedure = false;
+					check_func_can_cache_result(n, true);
 					$$ = (Node *)n;
 				}
 			| CREATE opt_or_replace definer_user FUNCTION func_name_opt_arg proc_args
@@ -16432,6 +16435,7 @@ CreateFunctionStmt:
 					n->options = $7;
 					n->withClause = $8;
 					n->isProcedure = false;
+					check_func_can_cache_result(n, false);
 					$$ = (Node *)n;
 				}
 			| CREATE opt_or_replace definer_user FUNCTION func_name_opt_arg proc_args
@@ -16477,6 +16481,7 @@ CreateFunctionStmt:
 					n->withClause = NIL;
 					n->isProcedure = false;
                     u_sess->parser_cxt.isCreateFuncOrProc = false;
+					check_func_can_cache_result(n, false);
 					$$ = (Node *)n;
 				}
 		;
@@ -18287,6 +18292,14 @@ common_func_opt_item:
 					BCompatibilityOptionSupportCheck($1);
 					$$ = makeDefElem("comment", (Node *)makeString($2));
 			    }
+			| RESULT_CACHE
+				{
+					$$ = makeDefElem("result_cache", (Node*)makeInteger(TRUE));
+				}
+			| NOT RESULT_CACHE
+				{
+					$$ = makeDefElem("result_cache", (Node*)makeInteger(FALSE));
+				}
 		;
 
 parallel_partition_opt:
@@ -32219,6 +32232,7 @@ unreserved_keyword:
 			| RESPECT_P
 			| RESTART
 			| RESTRICT
+			| RESULT_CACHE
 			| RESULT
 			| RETURN
 			| RETURNED_SQLSTATE

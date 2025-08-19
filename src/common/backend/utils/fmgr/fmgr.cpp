@@ -1142,6 +1142,11 @@ struct fmgr_security_definer_cache {
     Datum arg;            /* passthrough argument for plugin modules */
 };
 
+PLpgSQL_function* get_security_function(FunctionCallInfo fcinfo)
+{
+    return (PLpgSQL_function*)(((fmgr_security_definer_cache*)fcinfo->flinfo->fn_extra)->flinfo.fn_extra);
+}
+
 /*
  * Function handler for security-definer/proconfig/plugin-hooked functions.
  * We extract the OID of the actual function and do a fmgr lookup again.

@@ -614,6 +614,11 @@ typedef struct BloomFilterControl {
 
 #define InvalidBktId  (-1)    /* invalid hash-bucket id */
 
+typedef struct EStateFuncCache
+{
+    FuncCache *fncaches;
+} EStateFuncCache;
+
 /* ----------------
  *	  EState information
  *
@@ -699,6 +704,9 @@ typedef struct EState {
      * tuple.  Note that it will be created only if needed.
      */
     ExprContext* es_per_tuple_exprcontext;
+
+    struct EState* es_topstate;
+    EStateFuncCache	es_funcache;
 
     /*
      * These fields are for re-evaluating plan quals when an updated tuple is
