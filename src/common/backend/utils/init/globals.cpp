@@ -83,6 +83,7 @@ const uint32 GRAND_VERSION_NUM = 93063;
  * 2.VERSION NUM FOR EACH FEATURE
  *   Please write indescending order.
  ********************************************/
+const uint32 INLINEVIEW_DML_VERSION_NUM = 93063;
 const uint32 HALFVEC_VERSION_NUM = 93060;
 const uint32 IDENTITY_VERSION_NUM = 93059;
 const uint32 DISKANN_INDEX = 93058;

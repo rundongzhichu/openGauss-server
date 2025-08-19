@@ -1892,12 +1892,19 @@ typedef struct RotateInCell {
 /*
  * RangeSubselect - subquery appearing in a FROM clause
  */
+typedef enum ViewCheckOption {
+    NO_CHECK_OPTION,
+    LOCAL_CHECK_OPTION,
+    CASCADED_CHECK_OPTION
+} ViewCheckOption;
+
 typedef struct RangeSubselect {
     NodeTag type;
     bool lateral;   /* does it have LATERAL prefix? */
     Node *subquery; /* the untransformed sub-select clause */
     Alias *alias;   /* table alias & optional column aliases */
     RotateClause *rotate;
+    ViewCheckOption withCheckOption;
 } RangeSubselect;
 
 /*
@@ -2262,12 +2269,6 @@ typedef struct TransactionStmt {
  * Create View Statement
  * ----------------------
  */
-typedef enum ViewCheckOption {
-    NO_CHECK_OPTION,
-    LOCAL_CHECK_OPTION,
-    CASCADED_CHECK_OPTION
-} ViewCheckOption;
-
 typedef enum ViewSecurityOption {
     VIEW_SQL_SECURITY_NONE,
     VIEW_SQL_SECURITY_DEFINER,
