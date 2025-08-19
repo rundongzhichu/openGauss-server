@@ -257,6 +257,9 @@ test: single_node_update
 #test: single_node_delete
 test: single_node_delete_optimize
 
+# bloom_index
+test: bloom
+
 # ----------
 # Another group of parallel tests
 # ----------

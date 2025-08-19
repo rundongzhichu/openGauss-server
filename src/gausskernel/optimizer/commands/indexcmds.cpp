@@ -784,7 +784,8 @@ ObjectAddress DefineIndex(Oid relationId, IndexStmt* stmt, Oid indexRelationId, 
     }
 
     if (concurrent && (strcmp(stmt->accessMethod, "bm25") == 0 || strcmp(stmt->accessMethod, "hnsw") == 0 ||
-                       strcmp(stmt->accessMethod, "ivfflat") == 0 || strcmp(stmt->accessMethod, "diskann") == 0)) {
+                       strcmp(stmt->accessMethod, "ivfflat") == 0 || strcmp(stmt->accessMethod, "diskann") == 0 ||
+                       strcmp(stmt->accessMethod, "bloom") == 0)) {
         ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                         errmsg("concurrent index creation is not supported for %s", stmt->accessMethod)));
     }

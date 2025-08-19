@@ -32,6 +32,7 @@
 #define DEFAULT_HNSW_INDEX_TYPE "hnsw"
 #define DEFAULT_BM25_INDEX_TYPE "bm25"
 #define DEFAULT_DISKANN_INDEX_TYPE "diskann"
+#define DEFAULT_BLOOM_INDEX_TYPE "bloom"
 
 /* Typedef for callback function for IndexBuildHeapScan */
 typedef void (*IndexBuildCallback)(Relation index, HeapTuple htup, Datum *values, const bool *isnull,
