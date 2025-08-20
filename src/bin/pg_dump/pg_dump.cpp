@@ -60,6 +60,7 @@
 #include "catalog/pg_largeobject_metadata.h"
 #include "catalog/pg_partition.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_proc_ext.h"
 #include "catalog/pg_rlspolicy.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_publication.h"
@@ -14351,6 +14352,7 @@ static void dumpFunc(Archive* fout, FuncInfo* finfo)
     char* proshippable = NULL;
     char* propackage = NULL;
     char* protypeid = NULL;
+    char* resultCache = NULL;
     char* rettypename = NULL;
     char* propackageid = NULL;
     char* definer = NULL;
@@ -14370,6 +14372,7 @@ static void dumpFunc(Archive* fout, FuncInfo* finfo)
     bool isNullProargsrc = false;
     bool addDelimiter = false;
     bool isNullSelfloop = false;
+    bool hasResultCache = false;
     const char *funcKind;
     char* parallelCursorName = NULL;
     char* parallelCursorStrategy = NULL;
@@ -14400,6 +14403,7 @@ static void dumpFunc(Archive* fout, FuncInfo* finfo)
     isHasPropackage = is_column_exists(AH->connection, ProcedureRelationId, "propackage");
     hasProKindAttr = is_column_exists(AH->connection, ProcedureRelationId, "prokind");
     hasProargsrc = is_column_exists(AH->connection, ProcedureRelationId, "proargsrc");
+    hasResultCache = is_column_exists(AH->connection, ProcedureExtensionRelationId, "result_cache");
 
     /*
      * proleakproof was added at v9.2
@@ -14417,6 +14421,7 @@ static void dumpFunc(Archive* fout, FuncInfo* finfo)
         "%s, "
         "(SELECT lanname FROM pg_catalog.pg_language WHERE oid = prolang) AS lanname, "
         "%s, "
+        "%s, "
         "(SELECT 1 FROM pg_depend WHERE objid = p.oid AND objid = refobjid AND refclassid = 1255 LIMIT 1) AS selfloop, "
         "proargnames[o.parallel_cursor_seq + 1] AS parallelcursorname, o.parallel_cursor_strategy AS parallelcursorstrategy, "
         "pg_catalog.array_to_string(o.parallel_cursor_partkey, ', ') AS parallelcursorpartkey "
@@ -14427,6 +14432,7 @@ static void dumpFunc(Archive* fout, FuncInfo* finfo)
         isHasPropackage ? "propackage" : "NULL AS propackage",
         hasProKindAttr?"prokind":"'f' as prokind",
         hasProargsrc ? "proargsrc" : "NULL AS proargsrc",
+        hasResultCache ? "o.result_cache" : "false as result_cache",
         finfo->dobj.catId.oid);
 
     res = ExecuteSqlQueryForSingleRow(fout, query->data);
@@ -14455,6 +14461,7 @@ static void dumpFunc(Archive* fout, FuncInfo* finfo)
     parallelCursorName = PQgetvalue(res, 0, PQfnumber(res, "parallelcursorname"));
     parallelCursorStrategy = PQgetvalue(res, 0, PQfnumber(res, "parallelcursorstrategy"));
     parallelCursorPartKey = PQgetvalue(res, 0, PQfnumber(res, "parallelcursorpartkey"));
+    resultCache = PQgetvalue(res, 0, PQfnumber(res, "result_cache"));
 
     if ((gdatcompatibility != NULL) && strcmp(gdatcompatibility, B_FORMAT) == 0) {
         /* get definer user name */
@@ -14621,6 +14628,12 @@ static void dumpFunc(Archive* fout, FuncInfo* finfo)
             appendPQExpBuffer(headWithoutDefault, "CREATE DEFINER = \"%s\" %s %s ", definer, funcKind, funcsig);
         } else {
             appendPQExpBuffer(headWithoutDefault, "CREATE %s %s ", funcKind, funcsig);
+        }
+    }
+
+    if (hasResultCache) {
+        if (resultCache != NULL && resultCache[0] == 't') {
+            appendPQExpBuffer(q, " RESULT_CACHE");
         }
     }
 
