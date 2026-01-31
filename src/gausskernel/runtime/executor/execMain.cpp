@@ -38,6 +38,10 @@
  * -------------------------------------------------------------------------
  */
 
+ /**
+  * 执行引擎主函数
+  */
+
 #include "codegen/gscodegen.h"
 
 #include "postgres.h"
@@ -216,6 +220,10 @@ static void report_iud_time(QueryDesc *query)
  */
 void ExecutorStart(QueryDesc* queryDesc, int eflags)
 {
+    /**
+     * 功能：初始化执行器，准备执行查询
+     * 逻辑：为执行计划中的每个节点分配必要的资源，如内存缓冲区、文件句柄等。它还会初始化状态变量，以便在执行过程中跟踪执行状态。
+     */
     gstrace_entry(GS_TRC_ID_ExecutorStart);
 
     /* it's unsafe to deal with plugins hooks as dynamic lib may be released */
@@ -463,6 +471,11 @@ void standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
  */
 void ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count)
 {
+    /**
+     * 功能：根据执行计划执行查询。
+     * 逻辑：按照执行计划的顺序，递归地执行每个节点的操作。对于每个节点，执行器会调用相应的执行函数（如 ExecSeqScan、ExecHashJoin 等）来处理数据。
+     * 循环控制：执行器会根据不同的执行模式（如 ForwardScan、BackwardScan）控制数据的读取和处理过程。在每次调用 ExecutorRun 时，它会返回一个批次的数据
+     */
     /* sql active feature, opeartor history statistics */
     int instrument_option = 0;
     bool has_track_operator = false;
@@ -509,6 +522,7 @@ void ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long count)
         ExplainNodeFinish(queryDesc->planstate, NULL, (TimestampTz)0.0, true);
     }
 
+    // 按照执行计划执行的
     if (ExecutorRun_hook) {
         (*ExecutorRun_hook)(queryDesc, direction, count);
     } else {
@@ -728,6 +742,11 @@ void standard_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, long co
  */
 void ExecutorFinish(QueryDesc *queryDesc)
 {
+    /**
+     * 功能：完成执行器的执行阶段，清理资源。
+     * 逻辑：释放执行过程中分配的所有资源，包括内存缓冲区、文件句柄等。它还会执行一些必要的清理操作，如关闭打开的文件、释放锁等。
+     * 
+     */
     if (ExecutorFinish_hook) {
         (*ExecutorFinish_hook)(queryDesc);
     } else {
@@ -786,6 +805,12 @@ void standard_ExecutorFinish(QueryDesc *queryDesc)
  */
 void ExecutorEnd(QueryDesc *queryDesc)
 {
+    /**
+     * 
+     * 功能：结束执行器，释放所有资源。
+     * 逻辑：除了完成当前的执行阶段外，ExecutorEnd 还会确保所有资源都被正确释放，并且执行器的状态被重置。这对于确保数据库系统的稳定性和性能至关重要。
+     * 
+     */
     if (ExecutorEnd_hook) {
         (*ExecutorEnd_hook)(queryDesc);
     } else {

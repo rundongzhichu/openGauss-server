@@ -74,6 +74,7 @@ static void debug_print_log(PlannerInfo* root, Path* sortedpath, int debug_log_l
 RelOptInfo* query_planner(PlannerInfo* root, List* tlist,
              query_pathkeys_callback qp_callback, void *qp_extra)
 {
+    // todo 功能: 处理单个查询的执行计划，包括处理连接、过滤、排序等操作
     Query* parse = root->parse;
     List* joinlist = NIL;
     RelOptInfo* final_rel = NULL;

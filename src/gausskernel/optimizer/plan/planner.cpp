@@ -387,6 +387,7 @@ static Node* preprocess_const_params_worker(PlannerInfo* root, Node* expr, int k
  *****************************************************************************/
 PlannedStmt* planner(Query* parse, int cursorOptions, ParamListInfo boundParams)
 {
+    // todo 功能: 这是查询优化器的入口函数，负责生成整个查询的执行计划
     PlannedStmt* result = NULL;
     instr_time starttime;
     double totaltime = 0;
@@ -1391,6 +1392,7 @@ static void preprocess_ru_is_under_start_with(PlannerInfo* root)
 Plan* subquery_planner(PlannerGlobal* glob, Query* parse, PlannerInfo* parent_root, bool hasRecursion,
     double tuple_fraction, PlannerInfo** subroot, int options, ItstDisKey* diskeys, List* subqueryRestrictInfo)
 {
+    // todo 功能: 处理子查询的执行计划。  递归处理子查询  是优化的核心函数
     int num_old_subplans = list_length(glob->subplans);
     PlannerInfo* root = NULL;
     Plan* plan = NULL;

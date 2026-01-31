@@ -195,6 +195,7 @@ void print_parameters(const QueryDesc *queryDesc, ExplainState es)
         ParamExternData param_data = param_list_info->params[i];
         char* output_str = NULL;
         char* oid_name = NULL;
+        // 数据类型的唯一id
         Oid oid = param_data.ptype;
         if (oid == InvalidOid)
             continue;
