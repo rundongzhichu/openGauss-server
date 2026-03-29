@@ -1,7 +1,83 @@
 /* -------------------------------------------------------------------------
  *
  * nodeSort.cpp
- *	  Routines to handle sorting of relations.
+ *	  处理关系排序的函数
+ *    【核心作用】实现 SQL ORDER BY 子句的执行引擎，为查询结果提供有序输出
+ *
+ * 排序执行流程:
+ *   1. 首次调用（初始化阶段）
+ *      - 从外层子树读取所有元组
+ *      - 传递给 tuplesort 模块进行排序
+ *      - 排序结果保存到临时文件或内存
+ *   
+ *   2. 后续调用（返回阶段）
+ *      - 从已排序的文件/内存中依次获取元组
+ *      - 按指定扫描方向返回（正向/反向）
+ *
+ * 两种排序方式:
+ * 
+ * 1. Datum 排序（单列优化）
+ *    - 适用场景：结果只有单一列
+ *    - 性能优势：显著快于元组排序
+ *    - 特别是 pass-by-value 类型（如 int4, timestamp）
+ *    - 减少内存占用和比较开销
+ * 
+ * 2. 元组排序（多列通用）
+ *    - 适用场景：多列排序结果
+ *    - 支持复杂的排序键组合
+ *    - 可处理 pass-by-reference 类型
+ *    - 灵活的 NULL 值处理策略
+ *
+ * 关键参数:
+ *   - sort_mem: 排序使用的内存量（KB）
+ *     * 来自 plan_node->operatorMemKB
+ *     * 包含机架内存（RackMemory）增量
+ *     * 超过此值则溢出到磁盘
+ *   
+ *   - max_mem: 最大允许内存（可选限制）
+ *     * 来自 plan_node->operatorMaxMem
+ *     * 用于严格的内存控制场景
+ *   
+ *   - bounded: 有界排序优化
+ *     * 如果只需要前 N 个元组（LIMIT）
+ *     * 使用堆排序而非完全排序
+ *     * 时间复杂度 O(N log K) vs O(N log N)
+ *
+ * 特殊功能:
+ *   - 递归 UNION 的内部条目排序
+ *     * 通过 tuplesort_set_siblings 设置自定义排序函数
+ *     * 支持 CONNECT BY 等层次查询
+ *   
+ *   - 随机访问模式
+ *     * randomAccess = true 时支持双向扫描
+ *     * 需要额外的索引结构
+ *     * 适用于 MERGE JOIN 等需要回溯的场景
+ *
+ * 内存管理:
+ *   - 使用 work_mem 作为基础限制
+ *   - 动态调整：根据可用内存自动扩展
+ *   - 溢出处理：超出内存时使用临时文件
+ *   - DOP 感知：并行度影响内存分配（SET_DOP/S ET_NODEMEM）
+ *
+ * 性能监控:
+ *   - CHECK_FOR_INTERRUPTS(): 检查中断信号
+ *   - pgstat_report_waitstate: 报告等待状态（STATE_EXEC_SORT_FETCH_TUPLE）
+ *   - UpdateUniqueSQLStats: 更新唯一 SQL 统计信息
+ *   - SO1_printf: 调试信息输出（EXECUTOR_DEBUG 级别）
+ *
+ * 接口函数:
+ *   - ExecSort(): 排序节点主函数
+ *   - ExecInitSort(): 初始化排序状态
+ *   - ExecReScanSort(): 重新扫描（支持重复执行）
+ *   - ExecEndSort(): 释放排序资源
+ *
+ * 应用场景:
+ *   ✅ ORDER BY 子句
+ *   ✅ SELECT DISTINCT（先排序去重）
+ *   ✅ MERGE JOIN 的输入要求
+ *   ✅ 窗口函数的分区排序
+ *   ✅ LIMIT + ORDER BY（有界排序优化）
+ *   ✅ Top-N 查询
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group

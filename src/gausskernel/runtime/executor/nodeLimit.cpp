@@ -1,7 +1,131 @@
 /* -------------------------------------------------------------------------
  *
  * nodeLimit.cpp
- *	  Routines to handle limiting of query results where appropriate
+ *	  处理查询结果限制的函数（在适当时）
+ *    【核心作用】实现 SQL LIMIT/OFFSET 子句，控制返回的元组数量
+ *
+ * 核心功能:
+ *   1. LIMIT 限制
+ *      - 限制返回的最大行数
+ *      - 优化：达到限制后立即停止执行子计划
+ *      - 避免不必要的计算和 I/O
+ *   
+ *   2. OFFSET 偏移
+ *      - 跳过指定数量的行
+ *      - 常用于分页查询（OFFSET + LIMIT）
+ *      - 需要消耗掉前面的元组
+ *   
+ *   3. 百分比限制
+ *      - LIMIT n PERCENT：返回结果的前 n%
+ *      - 需要先收集所有元组计算总数
+ *      - 然后按比例确定实际数量
+ *   
+ *   4. WITH TIES 支持
+ *      - 包含并列的元组（ORDER BY 值相同）
+ *      - 可能返回超过 LIMIT 指定的数量
+ *      - 需要额外的排序和比较逻辑
+ *
+ * 接口函数:
+ *		ExecLimit		  - 提取有限范围的元组
+ *		ExecInitLimit	  - 初始化节点和子节点
+ *		ExecEndLimit	  - 关闭节点和子节点
+ *
+ * 状态机设计:
+ *   LIMIT_INITIAL: 初始状态
+ *     → 首次调用时计算 limit/offset 值
+ *     → 设置 position = 0
+ *     → 转换到 LIMIT_RESCAN
+   
+ *   LIMIT_RESCAN: 重新扫描状态
+ *     → 正向扫描时从子计划获取元组
+ *     → 跳过 OFFSET 指定的数量
+ *     → 返回 LIMIT 范围内的元组
+ *     → 空窗口时转到 LIMIT_EMPTY
+   
+ *   LIMIT_EMPTY: 空结果状态
+ *     → 子计划返回太少元组，无法产生输出
+ *     → 直接返回 NULL
+   
+ *   LIMIT_PERCENT: 百分比模式
+ *     → 先收集所有元组到 tuplestore
+ *     → 计算总数后确定实际 LIMIT 数量
+ *     → 再按比例返回
+
+ * 关键变量:
+ *   - offset: 要跳过的元组数量
+ *   - count: 要返回的元组数量
+ *   - position: 当前已处理的元组位置
+ *   - fraction: 百分比值（0-1 之间）
+ *   - isPercent: 是否为百分比模式
+ *   - noCount: 是否无计数要求（全部返回）
+ *   - withTies: 是否包含并列元组
+ *
+ * 优化策略:
+ * 
+ * 1. 早期终止（Early Termination）
+ *    - 达到 LIMIT 后立即停止子计划执行
+ *    - 避免不必要的计算和 I/O
+ *    - 对 expensive 子计划效果显著
+ * 
+ * 2. 下传边界（Pass-down Bound）
+ *    - 将 LIMIT 信息传递给子计划
+ *    - 子计划可进行有界排序优化
+ *    - 例如：使用堆排序而非完全排序
+ * 
+ * 3. 百分比模式优化
+ *    - 仅在必要时使用（isPercent = true）
+ *    - 一次性收集所有元组
+ *    - 使用 tuplestore 缓存中间结果
+ * 
+ * 4. 内存管理
+ *    - operator_mem: 运算符内存限制
+ *    - max_mem: 最大允许内存
+ *    - DOP 感知：并行度影响内存分配
+ *    - 自动溢出到临时文件
+
+ * 特殊处理:
+ * 
+ * 1. 反向扫描
+ *    - 如果 ScanDirectionIsBackward(direction)
+ *    - 直接返回 NULL（不支持反向 LIMIT）
+ * 
+ * 2. 空窗口检测
+ *    - count <= 0 或 fraction <= 0
+ *    - 立即返回 NULL，不执行子计划
+ * 
+ * 3. WITH TIES 实现
+ *    - 创建 outputSlot 存储输出元组
+ *    - 比较 ORDER BY 值判断是否并列
+ *    - 可能返回超过 LIMIT 的元组
+ * 
+ * 4. 百分比计算
+ *    - 先收集所有元组计算总数 tuple_num
+ *    - count = ceil(fraction * tuple_num)
+ *    - 使用 tuplestore 缓存结果
+ *
+ * 统计报告:
+ *   - REPORT_LIMIT_THRESHOLD (5000): 报告阈值
+ *   - 超过此值的 LIMIT 操作记录原因类型
+ *   - 用于性能分析和优化建议
+ *
+ * 等待事件:
+ *   - CHECK_FOR_INTERRUPTS(): 检查中断信号
+ *   - 支持用户取消长时间运行的 LIMIT 查询
+ *
+ * 应用场景:
+ *   ✅ 简单分页：LIMIT 10 OFFSET 20
+ *   ✅ Top-N 查询：SELECT ... ORDER BY x LIMIT 10
+ *   ✅ 百分比采样：LIMIT 10 PERCENT
+ *   ✅ 防过拟合：限制调试时的输出量
+ *   ✅ 流式处理：分批处理大数据集
+ *   ✅ 并列排名：LIMIT 10 WITH TIES
+ *
+ * 性能考虑:
+ *   - 小 OFFSET：快速跳过，开销小
+ *   - 大 OFFSET：需要消耗大量元组，考虑用游标
+ *   - LIMIT + ORDER BY：可结合索引优化
+ *   - LIMIT + DISTINCT：先排序去重再限制
+ *   - 子计划是嵌套循环：早期终止效果显著
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group

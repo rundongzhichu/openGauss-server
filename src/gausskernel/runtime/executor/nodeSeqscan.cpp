@@ -1,7 +1,35 @@
 /* -------------------------------------------------------------------------
  *
  * nodeSeqscan.cpp
- *	  Support routines for sequential scans of relations.
+ *	  顺序扫描关系的支持函数
+ *    【核心作用】实现执行器中最基础的表访问方式 - 全表顺序扫描
+ *
+ * 功能说明:
+ *   顺序扫描（Sequential Scan）是数据库最基本的表访问方法：
+ *   - 从表的第一个数据块开始，依次读取所有页面
+ *   - 对每个页面中的所有元组进行过滤条件检查
+ *   - 返回满足条件的元组
+ *   
+ *   适用场景:
+ *   - 小表查询（全表扫描代价低）
+ *   - 没有合适索引的查询
+ *   - 需要访问大部分数据的查询（选择度低）
+ *   - 并行查询中的分片扫描
+ *
+ * 接口函数:
+ *		ExecSeqScan		  - 顺序扫描关系的主函数
+ *		ExecSeqNext		  - 按顺序获取下一个元组
+ *		ExecInitSeqScan	  - 创建并初始化顺序扫描节点
+ *		ExecEndSeqScan	  - 释放分配的存储空间
+ *		ExecReScanSeqScan - 重新扫描关系（支持重复执行）
+ *		ExecSeqMarkPos	  - 标记扫描位置（支持 MARK/RESTORE）
+ *		ExecSeqRestrPos	  - 恢复扫描位置
+ *
+ * 性能优化:
+ *   - 预读（Prefetch）：提前读取后续数据块，隐藏 I/O 延迟
+ *   - 批量处理：一次读取多个页面，减少系统调用
+ *   - 并行扫描：多线程同时扫描不同区域
+ *   - 可见性优化：快速判断元组对当前事务的可见性
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -55,15 +83,29 @@ static TupleTableSlot* ExecSeqScan(PlanState* state);
 extern void StrategyGetRingPrefetchQuantityAndTrigger(BufferAccessStrategy strategy, int* quantity, int* trigger);
 /* ----------------------------------------------------------------
  *		prefetch_pages
- *
- *		1,Offset and last here are used as signed  quantities that can be less than 0
- *		2,Put a kludge here to make the <0 check work, to prevent propagating a negative
- *		  number of pages to PageRangePrefetch()
+ *     预读页面 - 性能优化关键函数
+ * 
+ * 【功能说明】提前读取后续的数据块到缓冲区，隐藏 I/O 延迟
+ * 
+ * 【参数说明】
+ *     scan: 表扫描描述符
+ *     start_block: 起始预读的块号
+ *     offset: 预读的块数量（偏移量）
+ * 
+ * 【设计要点】
+ *     1. offset 和 last 使用有符号数，可以处理小于 0 的情况
+ *     2. 添加保护检查防止负数传递到 PageRangePrefetch()
+ *     3. 预读是异步的，不会阻塞当前执行
+ * 
+ * 【性能考虑】
+ *     - 预读距离太短：无法有效隐藏 I/O 延迟
+ *     - 预读距离太长：浪费缓冲区空间，可能污染缓存
+ *     - 最优值取决于：存储设备速度、缓冲区大小、查询模式
  * ----------------------------------------------------------------
  */
 void prefetch_pages(TableScanDesc scan, BlockNumber start_block, BlockNumber offset)
 {
-    /* Open it at the smgr level if not already done */
+    /* 如果 smgr 层未打开，先打开它 */
     PageRangePrefetch(scan->rs_rd, MAIN_FORKNUM, start_block, offset, 0, 0);
 
     return;
@@ -71,11 +113,32 @@ void prefetch_pages(TableScanDesc scan, BlockNumber start_block, BlockNumber off
 
 /* ----------------------------------------------------------------
  *		Start_Prefetch
- *
- *		1,Prefetch interfaces for Sequential Scans
- *		2,Start_Prefetch() calculates the optimal prefetch distance and invokes
- *		  prefetch_pages() to invoke the prefetch interface
- *		3,only the ADIO prefetch is provided here now
+ *     启动预读 - 顺序扫描的预读接口
+ * 
+ * 【功能说明】计算最优预读距离并调用 prefetch_pages() 启动预读
+ * 
+ * 【参数说明】
+ *     scan: 表扫描描述符
+ *     p_accessor: 顺序扫描访问器（包含预读配置信息）
+ *     dir: 扫描方向（向前/向后）
+ * 
+ * 【预读策略】
+ *     1. 首次预读：
+ *        - 向前扫描：从当前位置 +1 开始，预读 2*quantity 个页面
+ *        - 向后扫描：从当前位置向前推算
+ *     
+ *     2. 后续预读：
+ *        - 当扫描位置接近上次预读末尾时触发（trigger 阈值）
+ *        - 每次预读 quantity 个页面
+ *     
+ *     3. 边界处理：
+ *        - 检查是否超出表的范围
+ *        - 检查是否有足够的页面可预读
+ * 
+ * 【适用场景】
+ *     - 仅支持 ADIO（异步 I/O）预读
+ *     - 大表全表扫描时效果显著
+ *     - 小表或随机访问不适用
  * ----------------------------------------------------------------
  */
 void Start_Prefetch(TableScanDesc scan, SeqScanAccessor* p_accessor, ScanDirection dir)
@@ -84,20 +147,21 @@ void Start_Prefetch(TableScanDesc scan, SeqScanAccessor* p_accessor, ScanDirecti
     uint32 quantity, trigger;
     bool forward = false;
 
-    /* Disable prefetch on unsupported scans */
+    /* 不支持的扫描类型禁用预读 */
     if (p_accessor == NULL)
-        return;  // cannot prefetch this scan
+        return;  // 无法对此扫描进行预读
 
     if (scan->rs_nblocks == 0)
-        return;
+        return;  // 空表无需预读
 
-    quantity = p_accessor->sa_prefetch_quantity;
-    trigger = p_accessor->sa_prefetch_trigger;
-    last = p_accessor->sa_last_prefbf;
-    forward = ScanDirectionIsForward(dir);
+    quantity = p_accessor->sa_prefetch_quantity;  // 预读数量
+    trigger = p_accessor->sa_prefetch_trigger;    // 触发阈值
+    last = p_accessor->sa_last_prefbf;            // 上次预读的结束位置
+    forward = ScanDirectionIsForward(dir);        // 扫描方向
 
-    if (last == InvalidBlockNumber) { // first prefetch
+    if (last == InvalidBlockNumber) { // 首次预读
         if (forward) {
+            // 向前扫描的预读逻辑
             if (scan->rs_cblock == InvalidBlockNumber) {
                 start_pref = scan->rs_startblock + 1;
             } else {
@@ -106,15 +170,16 @@ void Start_Prefetch(TableScanDesc scan, SeqScanAccessor* p_accessor, ScanDirecti
 
             offset = 2 * quantity;
             if (start_pref + offset > scan->rs_nblocks) {
-                offset = scan->rs_nblocks - start_pref;
+                offset = scan->rs_nblocks - start_pref;  // 不能超出表范围
             }
 
             if (((int32)offset) > 0) {
                 prefetch_pages(scan, start_pref, offset);
                 last = start_pref + offset - 1;
             } else
-                return;  // nothing to prefetch
+                return;  // 没有可预读的内容
         } else {
+            // 向后扫描的预读逻辑
             offset = 2 * quantity;
             if (scan->rs_cblock == InvalidBlockNumber) {
                 start_pref = scan->rs_nblocks;
@@ -132,15 +197,18 @@ void Start_Prefetch(TableScanDesc scan, SeqScanAccessor* p_accessor, ScanDirecti
                 prefetch_pages(scan, start_pref, offset);
                 last = start_pref;
             } else
-                return;  // nothing to prefetch
+                return;  // 没有可预读的内容
         }
     } else {
+        // 后续预读逻辑
         if (scan->rs_cblock == InvalidBlockNumber)
-            return;  // do nothing
+            return;  // 无法处理
+        
         if (forward) {
             if (last >= scan->rs_nblocks - 1)
-                return;  // nothing to prefetch
+                return;  // 已经预读到末尾
 
+            // 当扫描位置接近预读位置时触发新的预读
             if (scan->rs_cblock >= last - trigger) {
                 start_pref = last + 1;
                 offset = quantity;
@@ -153,7 +221,7 @@ void Start_Prefetch(TableScanDesc scan, SeqScanAccessor* p_accessor, ScanDirecti
             }
         } else {
             if (((int32)last) <= 0)
-                return;  // nothing to prefetch
+                return;  // 已经预读到开头
             if (scan->rs_cblock < last + trigger) {
                 start_pref = last - quantity;
                 offset = quantity;
@@ -924,7 +992,7 @@ static inline void FlatTLtoBool(const List* targetList, bool* boolArr, AttrNumbe
         if ((variable->varoattno > 0) && (variable->varoattno <= natts)) {
             boolArr[variable->varoattno - 1] = false; /* sometimes varattno in parent is different */
         }
-        elog(DEBUG1, "PMZ-InitSeq FlatTLtoBool: varoattno: %d", variable->varoattno);
+        elog(DEBUG1, "PMZ-InitScan FlatTLtoBool: varoattno: %d", variable->varoattno);
     }
 }
 

@@ -1,7 +1,103 @@
 /* -------------------------------------------------------------------------
  *
  * nodeMaterial.cpp
- *	  Routines to handle materialization nodes.
+ *	  处理物化节点的函数
+ *    【核心作用】将子计划的结果缓存起来，支持多次扫描和回溯操作
+ *
+ * 物化的核心价值:
+ *   1. 支持重扫描（Rescan）
+ *      - 某些执行器节点需要多次读取同一数据源
+ *      - 例如：嵌套循环连接的内层、哈希连接的重复探测
+ *      - 物化避免重复执行昂贵的子计划
+ *   
+ *   2. 支持回溯（Mark/Restore）
+ *      - 某些算法需要在结果集中前后移动
+ *      - 例如：归并连接需要回溯到标记位置
+ *      - 物化提供随机访问能力
+ *   
+ *   3. 惰性求值优化
+ *      - 只在需要时才实际执行子计划
+ *      - 避免不必要的计算（如 LIMIT 提前终止）
+ *   
+ *   4. 内存与磁盘的平衡
+ *      - 小结果集：完全在内存中
+ *      - 大结果集：溢出到临时文件
+ *      - 自动管理，对用户透明
+ *
+ * 接口函数:
+ *		ExecMaterial		  - 物化子计划的结果
+ *		ExecInitMaterial	  - 初始化节点和子节点
+ *		ExecEndMaterial		  - 关闭节点和子节点
+ *
+ * 两种物化模式:
+ * 
+ * 1. 全量物化 (ExecMaterialAll)
+ *    - 适用场景：需要完整结果集
+ *    - 执行流程:
+ *      a. 首次调用：读取所有子计划元组，存入 tuplestore
+ *      b. 后续调用：从 tuplestore 中按序返回
+ *    - 支持正向/反向扫描
+ *    - 支持标记/恢复操作（如果 eflags & EXEC_FLAG_MARK）
+ * 
+ * 2. 单条物化 (ExecMaterialOne)
+ *    - 适用场景：只需顺序访问，不需要回溯
+ *    - 执行流程:
+ *      a. 每次调用返回一个子计划元组
+ *      b. 不缓存所有结果，按需读取
+ *    - 性能更优，但功能受限
+ *
+ * 关键数据结构:
+ *   - Tuplestorestate: 元组存储状态
+ *     * 支持内存和磁盘混合存储
+ *     * 提供读指针分配（支持多个并发扫描）
+ *     * 支持正向/反向遍历
+ *   
+ *   - eof_underlying: 底层子计划是否已读完
+ *     * false: 还可以继续读取新元组
+ *     * true: 所有元组已物化完成
+ *
+ * 内存管理:
+ *   - operator_mem: 运算符内存限制（来自 plan->operatorMemKB）
+ *   - max_mem: 最大允许内存（来自 plan->operatorMaxMem）
+ *   - DOP 感知：并行度影响内存分配（SET_DOP/SET_NODEMEM）
+ *   - 自动溢出：超过内存限制时使用临时文件
+ *
+ * 标记/恢复机制:
+ *   如果 eflags & EXEC_FLAG_MARK:
+ *   - 分配额外的读指针（索引固定为 1）
+ *   - 用于保存标记位置
+ *   - 支持恢复到该位置
+ *   - 典型应用：MERGE JOIN 的回溯需求
+ *
+ * 反向扫描处理:
+ *   当 ScanDirectionIsBackward(dir) 时:
+ *   - 如果在 tuplestore EOF 处反向，需要额外前移一次
+ *   - 因为第一次 advance 会获取最后添加的元组
+ *   - 但我们需要返回它之前的那个元组
+ *
+ * 统计信息收集:
+ *   当启用监控 (HAS_INSTR) 且存在 tuplestore 时:
+ *   - width: 平均元组宽度（仅首次扫描）
+ *   - sysBusy: tuplestore 繁忙状态
+ *   - spreadNum: 分散数量（并行执行相关）
+ *
+ * 等待事件报告:
+ *   - pgstat_report_waitstatus(STATE_EXEC_MATERIAL)
+ *   - 用于性能监控和诊断
+ *
+ * 应用场景:
+ *   ✅ 嵌套循环连接的内层输入
+ *   ✅ 哈希连接的重复探测阶段
+ *   ✅ 归并连接的输入（需要标记/恢复）
+ *   ✅ 子查询的物化（避免重复计算）
+ *   ✅ CTE（公共表表达式）的实现基础
+ *   ✅ 窗口函数的分区缓存
+ *
+ * 性能考虑:
+ *   - 小结果集：直接内存存储，快速访问
+ *   - 大结果集：磁盘溢出，I/O 开销
+ *   - 无重扫描需求：使用 ExecMaterialOne 避免缓存开销
+ *   - 有标记需求：分配额外读指针，轻微 overhead
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group

@@ -1,7 +1,163 @@
 /* -------------------------------------------------------------------------
  *
  * nodeMergejoin.cpp
- *	  routines supporting merge joins
+ *	  支持归并连接的函数
+ *    【核心作用】实现归并连接（Merge Join）算法，适用于已排序输入的等值连接场景
+ *
+ * 归并连接原理:
+ *   归并连接是一种高效的等值连接算法，特别适用于以下场景：
+ *   
+ *   1. 输入已排序
+ *      - 两个输入关系都已按连接键排序
+ *      - 或者可以通过索引扫描直接获得有序输出
+ *      - 避免额外的排序开销
+ *   
+ *   2. 等值连接
+ *      - 连接条件形式：outerKey = innerKey
+ *      - 支持复合连接键（多个等值条件组合）
+ *      - 不支持非等值连接（<, >, BETWEEN）
+ *   
+ *   3. 全外连接友好
+ *      - LEFT/RIGHT/FULL OUTER JOIN 的自然选择
+ *      - 可以高效处理未匹配的元组
+ *
+ * 核心算法思想:
+ * 
+ * 考虑以下示例：
+ * ```
+ * outer: (0 1 1 2 5 5 5 6 6 7)  当前：1
+ * inner: (1 3 5 5 5 5 6)        当前：3
+ * ```
+ * 
+ * 为了继续归并连接，执行器需要同时扫描内外关系直到找到匹配的元组 5。
+ * 它需要知道当前 inner tuple 3 "greater than" outer tuple 1，
+ * 因此应该先扫描 outer relation 找到匹配元组，依此类推。
+ *
+ * 关键操作:
+ *   1. 比较操作（MJCompare）
+ *      - 不直接执行连接子句
+ *      - 分别计算左右键表达式
+ *      - 逐列比较（使用 btree 比较函数）
+ *      - 利用 opfamily 和 collation 信息
+ *   
+ *   2. 标记/恢复（Mark/Restore）
+ *      - 当有多个相同的连接键值时（如多个 5）
+ *      - 需要标记 inner 的第一个位置
+ *      - 处理完 outer 的重复值后恢复到标记位置
+ *      - 访问方法接口提供 mark/restore 功能
+ *   
+ *   3. 同步扫描（Synchronize）
+ *      - 根据比较结果决定前进哪个输入
+ *      - outer < inner → 前进 outer
+ *      - outer > inner → 前进 inner
+ *      - outer == inner → 执行连接
+
+ * 归并连接算法的状态机:
+ * ```
+ * Join {
+ *     get initial outer and inner tuples     // INITIALIZE
+ *     
+ *     do forever {
+ *         // 阶段 1: 跳过不匹配的元组
+ *         while (outer != inner) {           // SKIP_TEST
+ *             if (outer < inner)
+ *                 advance outer              // SKIPOUTER_ADVANCE
+ *             else
+ *                 advance inner              // SKIPINNER_ADVANCE
+ *         }
+ *         
+ *         // 阶段 2: 标记 inner 位置
+ *         mark inner position                // SKIP_TEST
+ *         
+ *         // 阶段 3: 连接所有匹配的元组
+ *         do forever {
+ *             while (outer == inner) {
+ *                 join tuples                // JOINTUPLES
+ *                 advance inner position     // NEXTINNER
+ *             }
+ *             
+ *             advance outer position         // NEXTOUTER
+ *             
+ *             if (outer == mark) {           // TESTOUTER
+ *                 restore inner to mark      // 恢复到标记位置
+ *             } else {
+ *                 break  // 返回外层循环顶部
+ *             }
+ *         }
+ *     }
+ * }
+ * ```
+ *
+ * 状态机设计:
+ *   归并连接操作以状态机的形式编码。在每个状态下，我们做一些事情然后进入另一个状态。
+ *   这个状态存储在节点的执行状态信息中，并在 ExecMergeJoin 调用之间保持。
+ *
+ * 主要状态:
+ *   - EXEC_MJ_INITIAL: 初始化状态
+ *   - EXEC_MJ_JOINMARK: 标记 inner 元组
+ *   - EXEC_MJ_JOINTUPLES: 连接匹配的元组
+ *   - EXEC_MJ_NEXTOUTER: 前进 outer 元组
+ *   - EXEC_MJ_TESTOUTER: 测试是否需要恢复
+ *   - EXEC_MJ_SKIP_TEST: 跳过不匹配的元组
+ *   - EXEC_MJ_SKIPOUTER_ADVANCE: 前进 outer
+ *   - EXEC_MJ_SKIPINNER_ADVANCE: 前进 inner
+ *   - EXEC_MJ_END: 连接结束
+ *
+ * 数据结构:
+ *   MergeJoinClauseData: 每个归并连接子句的运行时数据
+ *   - lexpr/rexpr: 左右输入表达式树
+ *   - ldatum/rdatum: 当前左右表达式的值
+ *   - lisnull/risnull: 空值标志
+ *   - ssup: 排序支持数据（比较函数、collation 等）
+ *
+ * MJEvalResult: 元组评估结果类型
+ *   - MJEVAL_MATCHABLE: 正常，可能匹配的元组
+ *   - MJEVAL_NONMATCHABLE: 包含 NULL，无法连接
+ *   - MJEVAL_ENDOFJOIN: 输入结束（物理或逻辑）
+ *
+ * 接口函数:
+ *		ExecMergeJoin		  - 归并连接内外关系
+ *		ExecInitMergeJoin	  - 创建并初始化运行时状态
+ *		ExecEndMergeJoin	  - 清理节点
+ *
+ * 性能优化:
+ *   1. 避免排序
+ *      - 如果输入已有合适排序，直接使用
+ *      - 利用索引扫描的有序性
+ *      - 比 Hash Join 节省建表开销
+ *   
+ *   2. 流式处理
+ *      - 不需要物化整个输入
+ *      - 一次处理一个元组
+ *      - 内存占用低
+ *   
+ *   3. 早期终止
+ *      - 如果只需要部分结果（LIMIT）
+ *      - 可以在任意时刻停止
+ *      - 响应快速
+ *
+ * 适用场景:
+ *   ✅ 输入已按连接键排序
+ *   ✅ 等值连接（=）
+ *   ✅ 全外连接（LEFT/RIGHT/FULL）
+ *   ✅ 大表连接（流式处理）
+ *   ✅ 有可用索引
+ *   ❌ 非等值连接
+ *   ❌ 输入无序且无索引
+ *   ❌ 小表连接（Hash Join 更优）
+ *
+ * 与 Hash Join 对比:
+ *   Merge Join 优势:
+ *   - 不需要建哈希表，节省内存
+ *   - 流式处理，响应快
+ *   - 支持全外连接自然
+ *   - 输入已排序时性能极佳
+ *   
+ *   Hash Join 优势:
+ *   - 不要求输入有序
+ *   - 非等值连接也支持（某些变体）
+ *   - 小表连接更快
+ *   - 并行化更容易
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group

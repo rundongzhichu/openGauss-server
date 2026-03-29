@@ -1,7 +1,40 @@
 /* -------------------------------------------------------------------------
  *
  * nodeHashjoin.cpp
- *	  Routines to handle hash join nodes
+ *	  处理哈希连接节点的函数
+ *    【核心作用】实现混合哈希连接（Hybrid Hash Join）算法，是最常用的等值连接方法
+ *
+ * 哈希连接算法原理:
+ *   1. 构建阶段（Build Phase）
+ *      - 选择较小的关系作为内关系（inner）
+ *      - 根据连接键计算哈希值，构建哈希表
+ *      - 将内关系元组分散到不同的桶（bucket）中
+ *   
+ *   2. 探测阶段（Probe Phase）
+ *      - 扫描外关系（outer）的每个元组
+ *      - 对连接键计算相同的哈希值
+ *      - 在对应桶中查找匹配的元组
+ *      - 返回满足连接条件的元组对
+ *
+ * 混合哈希连接优化:
+ *   - 分区技术：当哈希表超过内存时，分批处理
+ *   - 批量处理：减少内存分配和 I/O 开销
+ *   - 流水线执行：边构建边探测
+ *
+ * 状态机设计:
+ *   HJ_BUILD_HASHTABLE    - 构建哈希表
+ *   HJ_NEED_NEW_OUTER     - 获取新的外关系元组
+ *   HJ_SCAN_BUCKET        - 扫描哈希桶
+ *   HJ_FILL_OUTER_TUPLE   - 填充外关系元组（左连接/全连接）
+ *   HJ_FILL_INNER_TUPLES  - 填充内关系元组（右连接/全连接）
+ *   HJ_NEED_NEW_BATCH     - 开始新的一批（溢出处理）
+ *
+ * 适用场景:
+ *   ✅ 等值连接（=）
+ *   ✅ 大表连接小表
+ *   ✅ 没有合适索引
+ *   ❌ 非等值连接（<, >, BETWEEN）
+ *   ❌ 需要排序的连接
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -49,125 +82,198 @@ static bool ExecHashJoinNewBatch(HashJoinState* hjstate);
 /* ----------------------------------------------------------------
  *		ExecHashJoin
  *
- *		This function implements the Hybrid Hashjoin algorithm.
+ *		执行哈希连接 - 核心状态机实现
  *
- *		Note: the relation we build hash table on is the "inner"
- *			  the other one is "outer".
+ *      【功能说明】实现混合哈希连接（Hybrid Hash Join）算法的状态机驱动
+ *                 这是数据库中最常用的等值连接方法
+ *
+ *      【算法原理】
+ *         1. 构建阶段（Build Phase）：选择较小的关系作为内关系，根据连接键构建哈希表
+ *         2. 探测阶段（Probe Phase）：扫描外关系的每个元组，在哈希表中查找匹配
+ *
+ *      【状态机设计】
+ *         HJ_BUILD_HASHTABLE    - 构建哈希表阶段
+ *         HJ_NEED_NEW_OUTER     - 获取新的外关系元组
+ *         HJ_SCAN_BUCKET        - 扫描哈希桶查找匹配
+ *         HJ_FILL_OUTER_TUPLE   - 填充外关系元组（左连接/全连接的空值填充）
+ *         HJ_FILL_INNER_TUPLES  - 填充内关系元组（右连接/全连接的空值填充）
+ *         HJ_NEED_NEW_BATCH     - 开始新的一批处理（哈希表溢出时的磁盘处理）
+ *
+ *      【返回值】
+ *         成功：返回一个连接后的元组槽（TupleTableSlot）
+ *         失败/结束：返回 NULL
+ *
+ *      【设计要点】
+ *         - 内关系（inner）：用于构建哈希表的关系（通常是较小的表）
+ *         - 外关系（outer）：用于探测哈希表的关系
+ *         - 批处理：支持哈希表溢出到磁盘的多批处理机制
+ *         - 空值填充：左/右/全外连接需要生成空值元组
+ *         - SPQ 优化：特殊查询处理的预取优化路径
+ *
+ *      【性能优化】
+ *         - 空关系优化：如果外关系为空且不是右/全连接，可跳过建表
+ *         - 启发式检查：重扫描时利用历史信息避免无效尝试
+ *         - 成本估算：当外关系启动成本低时，先检查是否为空
+ *         - 早期释放：构建完成后尽早释放内关系内存
+ *
+ *      Note: the relation we build hash table on is the "inner"
+ *            the other one is "outer".
  * ----------------------------------------------------------------
  */
 /* return: a tuple or NULL */
 static TupleTableSlot* ExecHashJoin(PlanState* state)
 {
     HashJoinState* node = castNode(HashJoinState, state);
-    PlanState* outerNode = NULL;
-    HashState* hashNode = NULL;
-    List* joinqual = NIL;
-    List* otherqual = NIL;
-    ExprContext* econtext = NULL;
-    ExprDoneCond isDone;
-    HashJoinTable hashtable;
-    TupleTableSlot* outerTupleSlot = NULL;
-    uint32 hashvalue;
-    int batchno;
-    MemoryContext oldcxt = NULL;
-    JoinType jointype;
+    PlanState* outerNode = NULL;       // 外关系计划节点（用于探测）
+    HashState* hashNode = NULL;        // 内关系计划节点（用于构建哈希表）
+    List* joinqual = NIL;              // 连接条件 qualifiers（hash join 的等值条件）
+    List* otherqual = NIL;             // 其他过滤条件（非等值条件）
+    ExprContext* econtext = NULL;      // 表达式执行上下文
+    ExprDoneCond isDone;               // 表达式执行完成状态
+    HashJoinTable hashtable;           // 哈希表指针
+    TupleTableSlot* outerTupleSlot = NULL;  // 外关系元组槽
+    uint32 hashvalue;                  // 元组的哈希值
+    int batchno;                       // 批号（多批处理时使用，处理溢出情况）
+    MemoryContext oldcxt = NULL;       // 原内存上下文（用于临时切换）
+    JoinType jointype;                 // 连接类型（INNER/LEFT/RIGHT/FULL/SEMI/ANTI 等）
 
     /*
-     * get information from HashJoin node
+     * 从 HashJoin 节点获取关键信息
      */
-    joinqual = node->js.joinqual;
-    otherqual = node->js.ps.qual;
-    hashNode = (HashState*)innerPlanState(node);
-    outerNode = outerPlanState(node);
-    hashtable = node->hj_HashTable;
-    econtext = node->js.ps.ps_ExprContext;
-    jointype = node->js.jointype;
+    joinqual = node->js.joinqual;                      // 获取连接条件
+    otherqual = node->js.ps.qual;                      // 获取其他过滤条件
+    hashNode = (HashState*)innerPlanState(node);       // 内计划节点（用于建哈希表）
+    outerNode = outerPlanState(node);                  // 外计划节点（用于探测）
+    hashtable = node->hj_HashTable;                    // 获取哈希表指针
+    econtext = node->js.ps.ps_ExprContext;             // 获取表达式上下文
+    jointype = node->js.jointype;                      // 获取连接类型
 
     /*
-     * Check to see if we're still projecting out tuples from a previous join
-     * tuple (because there is a function-returning-set in the projection
-     * expressions).  If so, try to project another one.
+     * 【步骤 1：处理集合返回函数的投影】
+     * 检查是否仍在从之前的连接元组投影元组
+     * （因为投影表达式中有返回集合的函数，如 unnest()）
+     * 如果是，尝试投影另一个元组
+     * 
+     * 场景：SELECT * FROM t1 JOIN t2 ON ... WHERE func() returns multiple values
      */
     if (node->js.ps.ps_vec_TupFromTlist) {
         TupleTableSlot* result = NULL;
 
         result = ExecProject(node->js.ps.ps_ProjInfo, &isDone);
         if (isDone == ExprMultipleResult)
-            return result;
-        /* Done with that source tuple... */
+            return result;  // 还有更多结果，直接返回
+        /* 完成该源元组的处理，重置标志 */
         node->js.ps.ps_vec_TupFromTlist = false;
     }
 
     /*
-     * Reset per-tuple memory context to free any expression evaluation
-     * storage allocated in the previous tuple cycle.  Note this can't happen
-     * until we're done projecting out tuples from a join tuple.
+     * 【步骤 2：内存管理】
+     * 重置每元组内存上下文，释放上一轮循环中
+     * 表达式评价分配的存储空间
+     * 
+     * 重要：必须等到完成连接元组的投影后才能执行此操作，
+     * 否则会导致正在使用的内存被提前释放
      */
     ResetExprContext(econtext);
 
     /*
-     * run the hash join state machine
+     * 【步骤 3：运行哈希连接状态机】
+     * 主循环：通过状态机驱动整个哈希连接过程
+     * 
+     * 循环特点：
+     *   - 可能多次迭代才返回一个元组（特别是在处理溢出批时）
+     *   - 每次迭代都检查中断信号，支持用户取消操作
+     *   - 根据当前状态执行不同的操作逻辑
      */
     for (;;) {
         /*
-         * It's possible to iterate this loop many times before returning a
-         * tuple, in some pathological cases such as needing to move much of
-         * the current batch to a later batch.  So let's check for interrupts
-         * each time through.
+         * 检查中断信号
+         * 
+         * 在某些病理情况下（如需要将大量当前批移动到后续批），
+         * 此循环可能在返回元组之前迭代多次。
+         * 因此每次迭代都检查中断信号，确保响应用户的取消请求
          */
         CHECK_FOR_INTERRUPTS();
         
+        /*
+         * 【状态机分发】
+         * 根据当前状态执行相应的操作
+         */
         switch (node->hj_JoinState) {
             case HJ_BUILD_HASHTABLE: {
                 /*
-                 * First time through: build hash table for inner relation.
+                 * 【状态 1：构建哈希表】
+                 * 第一次通过：为内关系构建哈希表
+                 * 
+                 * 这是哈希连接的第一个关键阶段：
+                 * 1. 选择内关系（通常是小表）
+                 * 2. 根据连接键计算哈希值
+                 * 3. 将元组分散到不同的哈希桶中
+                 * 4. 如果内存不足，会分批处理并溢出到磁盘
                  */
                 Assert(hashtable == NULL);
 #ifdef USE_SPQ
+                /*
+                 * 【SPQ 优化路径】
+                 * 特殊查询处理（Special Query Processing）的预取优化
+                 * 当启用 SPQ 且需要预取内关系时，跳过空关系检查
+                 */
                 if (IS_SPQ_RUNNING && node->prefetch_inner) {
                     node->hj_FirstOuterTupleSlot = NULL;
                     goto CREATE_HASH_TABLE;
                 }
 #endif
                 /*
-                 * If the outer relation is completely empty, and it's not
-                 * right/full join, we can quit without building the hash
-                 * table.  However, for an inner join it is only a win to
-                 * check this when the outer relation's startup cost is less
-                 * than the projected cost of building the hash table.
-                 * Otherwise it's best to build the hash table first and see
-                 * if the inner relation is empty.	(When it's a left join, we
-                 * should always make this check, since we aren't going to be
-                 * able to skip the join on the strength of an empty inner
-                 * relation anyway.)
+                 * 【空关系优化检查】
+                 * 
+                 * 优化策略：如果外关系完全为空，并且不是右/全连接，
+                 * 我们可以不构建哈希表就直接退出，节省资源
+                 * 
+                 * 成本考虑：
+                 *   - 对于内连接：只有当外关系的启动成本 < 构建哈希表的预计成本时，
+                 *     进行检查才有意义。否则最好先建表，再看内关系是否为空
+                 *   - 对于左连接：总是进行此检查，因为即使内关系为空也要返回左表数据
+                 *   - 对于右/全连接：不能跳过，因为需要构建哈希表来处理空值填充
                  *
-                 * If we are rescanning the join, we make use of information
-                 * gained on the previous scan: don't bother to try the
-                 * prefetch if the previous scan found the outer relation
-                 * nonempty. This is not 100% reliable since with new
-                 * parameters the outer relation might yield different
-                 * results, but it's a good heuristic.
+                 * 启发式优化：
+                 *   如果是重新扫描连接，利用上一次扫描的信息：
+                 *   - 如果上次发现外关系非空，则跳过预取检查
+                 *   - 这并非 100% 可靠（参数变化可能导致不同结果），但是很好的启发式
                  *
-                 * The only way to make the check is to try to fetch a tuple
-                 * from the outer plan node.  If we succeed, we have to stash
-                 * it away for later consumption by ExecHashJoinOuterGetTuple.
+                 * 实现方法：
+                 *   尝试从外计划节点获取一个元组：
+                 *   - 如果成功：保存该元组供后续使用
+                 *   - 如果失败：外关系为空，可以提前退出
                  */
-                // remove node->hj_streamBothSides after stream hang problem sloved.
+                // TODO: 解决流挂起问题后移除 node->hj_streamBothSides 判断
                 if (HJ_FILL_INNER(node)) {
-                    /* no chance to not build the hash table */
+                    /* 
+                     * 右/全连接：必须进行空值填充，无法跳过建表
+                     * 必须构建哈希表以处理内关系的未匹配元组
+                     */
                     node->hj_FirstOuterTupleSlot = NULL;
                 } else if ((HJ_FILL_OUTER(node) || (outerNode->plan->startup_cost < hashNode->ps.plan->total_cost &&
                                                        !node->hj_OuterNotEmpty)) &&
                            !node->hj_streamBothSides) {
+                    /*
+                     * 【尝试预取外关系元组】
+                     * 条件满足时尝试获取一个外关系元组：
+                     *   - 左/反连接：总是检查（需要处理空值填充）
+                     *   - 内连接：仅当外关系启动成本较低时检查
+                     *   - 且上次扫描未发现外关系非空
+                     */
                     node->hj_FirstOuterTupleSlot = ExecProcNode(outerNode);
                     if (TupIsNull(node->hj_FirstOuterTupleSlot)) {
+                        /*
+                         * 【外关系为空的处理】
+                         * 外关系完全为空，可以提前终止连接
+                         */
                         node->hj_OuterNotEmpty = false;
 
                         /*
-                         * If the outer relation is completely empty, and it's not right/full join,
-                         * we should deinit the consumer in right tree earlier.
-                         * It should be noticed that we can not do early deinit 
-                         * within predpush.
+                         * 【早期资源释放优化】
+                         * 如果外关系为空且不是右/全连接，应尽早释放右树（内关系）的消费者
+                         * 注意：不能在谓词下推（predpush）中进行早期释放
                          */
                         if (((PlanState*)node) != NULL && !CheckParamWalker((PlanState*)node)) {
                             ExecEarlyDeinitConsumer((PlanState*)node);
@@ -177,22 +283,41 @@ static TupleTableSlot* ExecHashJoin(PlanState* state)
                         EARLY_FREE_LOG(elog(LOG, "Early Free: HashJoin early return NULL"
                             " at node %d, memory used %d MB.", (node->js.ps.plan)->plan_node_id,
                             getSessionMemoryUsageMB()));
-                        return NULL;
-                    } else
+                        return NULL;  // 提前返回，无需构建哈希表
+                    } else {
+                        /* 外关系非空，记录标志供后续扫描使用 */
                         node->hj_OuterNotEmpty = true;
-                } else
+                    }
+                } else {
+                    /* 不进行预取检查，直接进入建表阶段 */
                     node->hj_FirstOuterTupleSlot = NULL;
+                }
 #ifdef USE_SPQ
 CREATE_HASH_TABLE:
+                /*
+                 * 【SPQ 空值处理策略】
+                 * 确定是否需要在哈希表中保留空值
+                 *   - 右/全连接：需要保留（用于空值填充）
+                 *   - 非等值连接：可能需要保留
+                 */
                 bool keepNulls = (IS_SPQ_RUNNING) ?
                     (HJ_FILL_INNER(node) || hashNode->hs_keepnull):
                     (HJ_FILL_INNER(node) || node->js.nulleqqual != NIL);
 #endif
                 /*
-                 * create the hash table, sometimes we should keep nulls
+                 * 【创建哈希表】
+                 * 
+                 * 关键参数：
+                 *   - hashNode->ps.plan: 哈希计划节点
+                 *   - hj_HashOperators: 哈希操作符列表
+                 *   - keepNulls: 是否保留空值（外连接时需要）
+                 *   - hj_hashCollations: 哈希排序规则
+                 *
+                 * 内存管理：
+                 *   切换到哈希节点的内存上下文，确保哈希表内存正确归属
                  */
                 if (hashNode->ps.nodeContext) {
-                    /* enable_memory_limit */
+                    /* 启用内存限制管理 */
                     oldcxt = MemoryContextSwitchTo(hashNode->ps.nodeContext);
                 }
 #ifdef USE_SPQ
@@ -203,111 +328,161 @@ CREATE_HASH_TABLE:
                     HJ_FILL_INNER(node) || node->js.nulleqqual != NIL, node->hj_hashCollations);
 #endif                    
                 if (oldcxt) {
-                    /* enable_memory_limit */
+                    /* 恢复原内存上下文 */
                     MemoryContextSwitchTo(oldcxt);
                 }
                 
-                node->hj_HashTable = hashtable;
+                node->hj_HashTable = hashtable;  // 保存哈希表引用
 #ifdef USE_SPQ
+                /*
+                 * 【SPQ 特殊处理】
+                 * 对于 LASJ_NOTIN 连接类型，如果哈希键为空则退出
+                 */
                 if (IS_SPQ_RUNNING) {
                     hashNode->hs_quit_if_hashkeys_null = (node->js.jointype == JOIN_LASJ_NOTIN);
                 }
 #endif
                 /*
-                 * execute the Hash node, to build the hash table
+                 * 【执行哈希节点，构建哈希表】
+                 * 
+                 * 这是构建阶段的核心操作：
+                 * 1. 执行内关系计划节点
+                 * 2. 对每个元组计算哈希值
+                 * 3. 将元组插入到对应的哈希桶中
+                 * 4. 如果内存超限，自动进行批处理和磁盘溢出
+                 *
+                 * 性能监控：
+                 *   报告等待状态，便于性能分析和监控
                  */
                 WaitState oldStatus = pgstat_report_waitstatus(STATE_EXEC_HASHJOIN_BUILD_HASH);
-                hashNode->hashtable = hashtable;
+                hashNode->hashtable = hashtable;  // 关联哈希表到哈希节点
                 hashNode->ps.hbktScanSlot.currSlot = node->js.ps.hbktScanSlot.currSlot;
-                (void)MultiExecProcNode((PlanState*)hashNode);
+                (void)MultiExecProcNode((PlanState*)hashNode);  // 执行构建
                 (void)pgstat_report_waitstatus(oldStatus);
 
-                /* Early free right tree after hash table built */
+                /* 【早期释放优化】哈希表构建完成后，立即释放右树（内关系）资源 */
                 ExecEarlyFree((PlanState*)hashNode);
 
                 EARLY_FREE_LOG(elog(LOG, "Early Free: Hash Table for HashJoin"
                     " is built at node %d, memory used %d MB.",
                     (node->js.ps.plan)->plan_node_id, getSessionMemoryUsageMB()));
 #ifdef USE_SPQ
+                /*
+                 * 【SPQ 特殊处理】
+                 * 对于 LASJ_NOTIN 连接，如果哈希键为空则直接返回
+                 */
                 if (IS_SPQ_RUNNING && node->js.jointype == JOIN_LASJ_NOTIN && hashNode->hs_hashkeys_null)
                     return NULL;
 #endif
                 /*
-                 * If the inner relation is completely empty, and we're not
-                 * doing a left outer join, we can quit without scanning the
-                 * outer relation.
+                 * 【内关系为空优化】
+                 * 
+                 * 如果内关系（哈希表）完全为空，并且不是左外连接，
+                 * 可以直接退出，无需扫描外关系
+                 * 
+                 * 例外情况：
+                 *   - 左连接：即使内关系为空，也要返回外关系的所有元组（带空值填充）
+                 *   - 全连接：需要处理两边的空值填充
                  */
                 if (hashtable->totalTuples == 0 && !HJ_FILL_OUTER(node)) {
                     /*
-                     * When hash table size is zero, no need to fetch left tree any more and
-                     * should deinit the consumer in left tree earlier.
-                     * It should be noticed that we can not do early deinit 
-                     * within predpush.
+                     * 【早期资源释放】
+                     * 哈希表大小为 0 时，无需再从左树（外关系）获取数据
+                     * 应尽早释放左树的消费者资源
+                     * 注意：不能在谓词下推（predpush）中进行早期释放
                      */
                     if (((PlanState*)node) != NULL && !CheckParamWalker((PlanState*)node)) {
                         ExecEarlyDeinitConsumer((PlanState*)node);
                     }
 
-                    return NULL;
+                    return NULL;  // 提前终止，无匹配可能
                 }
 #ifdef USE_SPQ
+            /* 【SPQ 状态记录】记录内关系是否为空的状态 */
             if (IS_SPQ_RUNNING) {
                 node->hj_InnerEmpty = (hashtable->totalTuples == 0);
             }
 #endif
                 /*
-                 * need to remember whether nbatch has increased since we
-                 * began scanning the outer relation
+                 * 【记录批处理起始状态】
+                 * 需要记住开始扫描外关系时的批次数
+                 * 用于后续判断是否有新的批次产生（溢出处理）
                  */
                 hashtable->nbatch_outstart = hashtable->nbatch;
 
                 /*
-                 * Reset OuterNotEmpty for scan.  (It's OK if we fetched a
-                 * tuple above, because ExecHashJoinOuterGetTuple will
-                 * immediately set it again.)
+                 * 【重置外关系非空标志】
+                 * 为扫描做准备。如果上面已经获取了一个元组也没关系，
+                 * 因为 ExecHashJoinOuterGetTuple 会立即重新设置它
                  */
                 node->hj_OuterNotEmpty = false;
 
+                /* 【状态转换】进入"需要新外关系元组"状态 */
                 node->hj_JoinState = HJ_NEED_NEW_OUTER;
             }
-            /* fall through */
+            /* fall through - 直接落入下一个状态处理 */
+            
             case HJ_NEED_NEW_OUTER:
-
                 /*
-                 * We don't have an outer tuple, try to get the next one
+                 * 【状态 2：获取新的外关系元组】
+                 * 
+                 * 当前没有外关系元组，尝试获取下一个
+                 * 来源可能是：
+                 *   - 首次执行：从外计划节点获取
+                 *   - 后续批次：从临时文件读取（溢出处理）
                  */
                 outerTupleSlot = ExecHashJoinOuterGetTuple(outerNode, node, &hashvalue);
                 if (TupIsNull(outerTupleSlot)) {
-                    /* end of batch, or maybe whole join */
+                    /*
+                     * 【当前批次结束或整个连接完成】
+                     * 没有更多外关系元组了
+                     */
                     if (HJ_FILL_INNER(node)) {
-                        /* set up to scan for unmatched inner tuples */
+                        /*
+                         * 右/全连接：需要扫描哈希表中未匹配的内关系元组
+                         * 准备进行空值填充
+                         */
                         ExecPrepHashTableForUnmatched(node);
-                        node->hj_JoinState = HJ_FILL_INNER_TUPLES;
-                    } else
+                        node->hj_JoinState = HJ_FILL_INNER_TUPLES;  // 转入填充内关系状态
+                    } else {
+                        /* 不需要填充内关系，直接进入下一批次 */
                         node->hj_JoinState = HJ_NEED_NEW_BATCH;
-                    continue;
+                    }
+                    continue;  // 继续状态机循环
                 }
 
+                /* 【设置外关系元组到表达式上下文】 */
                 econtext->ecxt_outertuple = outerTupleSlot;
+                /* 【重置匹配标志】假设当前元组尚未找到匹配 */
                 node->hj_MatchedOuter = false;
 
                 /*
-                 * Find the corresponding bucket for this tuple in the main
-                 * hash table or skew hash table.
+                 * 【计算哈希桶位置】
+                 * 在主流水线哈希表或倾斜哈希表中找到该元组对应的桶
+                 * 
+                 * 关键变量：
+                 *   - hj_CurHashValue: 当前元组的哈希值
+                 *   - hj_CurBucketNo: 主哈希桶编号
+                 *   - batchno: 批次号（处理溢出时用）
+                 *   - hj_CurSkewBucketNo: 倾斜桶编号（优化热点数据）
                  */
                 node->hj_CurHashValue = hashvalue;
                 ExecHashGetBucketAndBatch(hashtable, hashvalue, &node->hj_CurBucketNo, &batchno);
                 node->hj_CurSkewBucketNo = ExecHashGetSkewBucket(hashtable, hashvalue);
-                node->hj_CurTuple = NULL;
+                node->hj_CurTuple = NULL;  // 初始化当前元组指针
 
                 /*
-                 * The tuple might not belong to the current batch (where
-                 * "current batch" includes the skew buckets if any).
+                 * 【批次检查】
+                 * 该元组可能不属于当前批次（"当前批次"包括倾斜桶）
+                 * 
+                 * 场景：哈希表在构建过程中发生了溢出，增加了批次数
+                 * 此时部分外关系元组需要推迟到后续批次处理
                  */
                 if (batchno != hashtable->curbatch && node->hj_CurSkewBucketNo == INVALID_SKEW_BUCKET_NO) {
                     /*
-                     * Need to postpone this outer tuple to a later batch.
-                     * Save it in the corresponding outer-batch file.
+                     * 【延迟处理】
+                     * 需要将此外关系元组推迟到后续批次处理
+                     * 将其保存到对应的外关系批次文件中（磁盘溢出）
                      */
                     Assert(batchno > hashtable->curbatch);
                     MinimalTuple tuple = ExecFetchSlotMinimalTuple(outerTupleSlot);
@@ -315,20 +490,31 @@ CREATE_HASH_TABLE:
                     *hashtable->spill_size += sizeof(uint32) + tuple->t_len;
                     pgstat_increase_session_spill_size(sizeof(uint32) + tuple->t_len);
 
-                    /* Loop around, staying in HJ_NEED_NEW_OUTER state */
+                    /* 保持在 HJ_NEED_NEW_OUTER 状态，继续获取下一个元组 */
                     continue;
                 }
 
-                /* OK, let's scan the bucket for matches */
+                /* 【准备扫描】元组属于当前批次，可以扫描桶进行匹配 */
                 node->hj_JoinState = HJ_SCAN_BUCKET;
 
-                /* Prepare for the clear-process if necessary */
+                /* 【右连接预处理】为右反/右半连接准备清除处理 */
                 if (jointype == JOIN_RIGHT_ANTI || jointype == JOIN_RIGHT_SEMI)
                     node->hj_PreTuple = NULL;
 
-                /* fall through */
+                /* fall through - 直接落入扫描桶状态 */
             case HJ_SCAN_BUCKET:
+                /*
+                 * 【状态 3：扫描哈希桶】
+                 * 
+                 * 扫描选定的哈希桶，查找与当前外关系元组匹配的内关系元组
+                 * 这是哈希连接的核心探测阶段
+                 */
 #ifdef USE_SPQ
+                /*
+                 * 【SPQ 特殊处理】
+                 * 对于 LASJ_NOTIN 连接，如果连接表达式为空且内关系非空，
+                 * 直接标记为已匹配，跳过扫描
+                 */
                 if (IS_SPQ_RUNNING && node->js.jointype == JOIN_LASJ_NOTIN && !node->hj_InnerEmpty &&
                     IsJoinExprNull(node->hj_OuterHashKeys, econtext)) {
                     node->hj_MatchedOuter = true;
@@ -337,48 +523,74 @@ CREATE_HASH_TABLE:
                 }
 #endif
                 /*
-                 * Scan the selected hash bucket for matches to current outer
+                 * 【扫描哈希桶】
+                 * 在选定的桶中查找匹配的内关系元组
+                 * 
+                 * 返回值：
+                 *   true: 找到匹配的元组，并设置了相关状态
+                 *   false: 桶中所有元组都已扫描完毕，无更多匹配
                  */
                 if (!ExecScanHashBucket(node, econtext)) {
-                    /* out of matches; check for possible outer-join fill */
+                    /*
+                     * 【无更多匹配】
+                     * 已扫描完桶中所有元组，没有更多匹配
+                     * 检查是否需要进行外连接的空值填充
+                     */
                     node->hj_JoinState = HJ_FILL_OUTER_TUPLE;
                     continue;
                 }
 
                 /*
-                 * We've got a match, but still need to test non-hashed quals.
-                 * ExecScanHashBucket already set up all the state needed to
-                 * call ExecQual.
-                 *
-                 * If we pass the qual, then save state for next call and have
-                 * ExecProject form the projection, store it in the tuple
-                 * table, and return the slot.
-                 *
-                 * Only the joinquals determine tuple match status, but all
-                 * quals must pass to actually return the tuple.
+                 * 【找到匹配，但需验证非哈希条件】
+                 * 
+                 * ExecScanHashBucket 已经设置了调用 ExecQual 所需的所有状态
+                 * 
+                 * 匹配逻辑：
+                 *   - 只有 joinqual（等值条件）决定元组是否匹配
+                 *   - 但所有条件（joinqual + otherqual）都必须通过才能返回元组
+                 * 
+                 * 如果通过条件测试：
+                 *   1. 保存状态供下次调用
+                 *   2. 执行投影（ExecProject）
+                 *   3. 将结果存入元组表
+                 *   4. 返回元组槽
                  */
                 if (joinqual == NIL || ExecQual(joinqual, econtext, false)) {
+                    /* 【标记为已匹配】 */
                     node->hj_MatchedOuter = true;
 
                     /*
-                     * for right-anti join: skip and delete the matched tuple;
-                     * for right-semi join: return and delete the matched tuple;
-                     * for right-anti-full join: skip and delete the matched tuple;
+                     * 【右连接特殊处理】
+                     * 根据不同连接类型处理匹配的元组：
+                     * 
+                     *   - RIGHT_ANTI（右反连接）：跳过并删除匹配的内元组
+                     *   - RIGHT_SEMI（右半连接）：返回并删除匹配的内元组（只返回一次）
+                     *   - RIGHT_ANTI_FULL（右反全连接）：跳过并删除匹配的内元组
+                     * 
+                     * 删除操作：从链表或倾斜桶中移除已匹配的元组
                      */
                     if (jointype == JOIN_RIGHT_ANTI || jointype == JOIN_RIGHT_SEMI ||
                         jointype == JOIN_RIGHT_ANTI_FULL) {
+                        /* 从链表中删除当前匹配的元组 */
                         if (node->hj_PreTuple)
                             node->hj_PreTuple->next = node->hj_CurTuple->next;
                         else if (node->hj_CurSkewBucketNo != INVALID_SKEW_BUCKET_NO)
                             hashtable->skewBucket[node->hj_CurSkewBucketNo]->tuples = node->hj_CurTuple->next;
                         else
                             hashtable->buckets[node->hj_CurBucketNo] = node->hj_CurTuple->next;
+                        
+                        /* 右反连接：不返回匹配的元组，继续处理下一个 */
                         if (jointype == JOIN_RIGHT_ANTI || jointype == JOIN_RIGHT_ANTI_FULL)
                             continue;
                     } else {
+                        /* 【标记内元组为已匹配】用于后续的空值填充检查 */
                         HeapTupleHeaderSetMatch(HJTUPLE_MINTUPLE(node->hj_CurTuple));
 
-                        /* Anti join: we never return a matched tuple */
+                        /*
+                         * 【反连接处理】
+                         * 反连接（ANTI JOIN）：从不返回匹配的元组
+                         * 只要找到匹配，就丢弃外关系元组，处理下一个
+                         */
 #ifdef USE_SPQ
                         if (jointype == JOIN_ANTI || jointype == JOIN_LEFT_ANTI_FULL ||
                             (IS_SPQ_RUNNING && jointype == JOIN_LASJ_NOTIN)) {
@@ -389,44 +601,76 @@ CREATE_HASH_TABLE:
                             continue;
                         }
 
+                        /*
+                         * 【单次匹配优化】
+                         * 如果是 SEMI JOIN 或内关系唯一，找到一个匹配就够了
+                         * 可以直接处理下一个外关系元组
+                         */
                         if (node->js.single_match) {
                             node->hj_JoinState = HJ_NEED_NEW_OUTER;
                         }
                     }
 
+                    /*
+                     * 【验证其他条件】
+                     * 检查非哈希条件（otherqual）
+                     * 如果通过，执行投影并返回结果
+                     */
                     if (otherqual == NIL || ExecQual(otherqual, econtext, false)) {
                         TupleTableSlot* result = NULL;
                         
                         result = ExecProject(node->js.ps.ps_ProjInfo, &isDone);
                         if (isDone != ExprEndResult) {
+                            /* 记录是否需要继续投影（集合返回函数） */
                             node->js.ps.ps_vec_TupFromTlist = (isDone == ExprMultipleResult);
-                            return result;
+                            return result;  // 返回连接结果
                         }
-                    } else
+                    } else {
+                        /* 【其他条件过滤】统计被 otherqual 过滤的元组数 */
                         InstrCountFiltered2(node, 1);
+                    }
                 } else {
+                    /* 【连接条件过滤】统计被 joinqual 过滤的元组数 */
                     InstrCountFiltered1(node, 1);
-                    /* For right Semi/Anti join, we set hj_PreTuple following hj_CurTuple */
+                    /* 
+                     * 【右半/反连接跟踪】
+                     * 对于右半/反连接，需要跟踪前一个元组以便删除
+                     */
                     if (jointype == JOIN_RIGHT_ANTI || jointype == JOIN_RIGHT_SEMI)
                         node->hj_PreTuple = node->hj_CurTuple;
                 }
                 break;
 
             case HJ_FILL_OUTER_TUPLE:
-
                 /*
-                 * The current outer tuple has run out of matches, so check
-                 * whether to emit a dummy outer-join tuple.  Whether we emit
-                 * one or not, the next state is NEED_NEW_OUTER.
+                 * 【状态 4：填充外关系元组（左/全外连接）】
+                 * 
+                 * 当前外关系元组已无匹配，检查是否需要发出虚拟的外连接元组
+                 * （即用 NULL 填充内关系字段）
+                 * 
+                 * 适用场景：
+                 *   - LEFT JOIN：左表元组在右表中无匹配时，用 NULL 填充右表字段
+                 *   - FULL JOIN：两边都需要处理空值填充
+                 * 
+                 * 无论是否发出空值元组，下一个状态都是 NEED_NEW_OUTER
                  */
                 node->hj_JoinState = HJ_NEED_NEW_OUTER;
 
+                /*
+                 * 【生成空值填充元组】
+                 * 条件：
+                 *   1. 当前外关系元组未找到任何匹配（!hj_MatchedOuter）
+                 *   2. 需要做外关系填充（HJ_FILL_OUTER，即左/全连接）
+                 */
                 if (!node->hj_MatchedOuter && HJ_FILL_OUTER(node)) {
                     /*
-                     * Generate a fake join tuple with nulls for the inner
-                     * tuple, and return it if it passes the non-join quals.
+                     * 生成一个虚拟的连接元组：
+                     *   - 外关系字段：保持原值
+                     *   - 内关系字段：全部填充为 NULL
+                     * 
+                     * 如果通过非连接条件过滤，则返回该元组
                      */
-                    econtext->ecxt_innertuple = node->hj_NullInnerTupleSlot;
+                    econtext->ecxt_innertuple = node->hj_NullInnerTupleSlot;  // 内关系全 NULL 的元组槽
 
                     if (otherqual == NIL || ExecQual(otherqual, econtext, false)) {
                         TupleTableSlot* result = NULL;
@@ -435,31 +679,52 @@ CREATE_HASH_TABLE:
 
                         if (isDone != ExprEndResult) {
                             node->js.ps.ps_vec_TupFromTlist = (isDone == ExprMultipleResult);
-                            return result;
+                            return result;  // 返回空值填充的连接结果
                         }
-                    } else
+                    } else {
+                        /* 【条件过滤】统计被 otherqual 过滤的空值填充元组 */
                         InstrCountFiltered2(node, 1);
+                    }
                 }
                 break;
 
             case HJ_FILL_INNER_TUPLES:
-
                 /*
-                 * We have finished a batch, but we are doing right/full/rightAnti join,
-                 * so any unmatched inner tuples in the hashtable have to be
-                 * emitted before we continue to the next batch.
+                 * 【状态 5：填充内关系元组（右/全外连接）】
+                 * 
+                 * 已完成一个批次的扫描，但由于是右/全/右反连接，
+                 * 哈希表中可能还有未匹配的内关系元组需要处理
+                 * 
+                 * 适用场景：
+                 *   - RIGHT JOIN：右表元组在左表中无匹配时，用 NULL 填充左表字段
+                 *   - FULL JOIN：需要处理两边的未匹配元组
+                 *   - RIGHT_ANTI：需要识别未匹配的右表元组
+                 * 
+                 * 处理时机：在每个批次结束时，在处理下一批次之前
+                 */
+                /*
+                 * 【扫描哈希表中的未匹配元组】
+                 * 遍历哈希表，找出所有未被匹配的内关系元组
+                 * 
+                 * 返回值：
+                 *   true: 找到了未匹配的元组，并设置了相关状态
+                 *   false: 所有未匹配元组都已处理完毕
                  */
                 if (!ExecScanHashTableForUnmatched(node, econtext)) {
-                    /* no more unmatched tuples */
+                    /* 没有更多未匹配的元组了，进入下一批次处理 */
                     node->hj_JoinState = HJ_NEED_NEW_BATCH;
                     continue;
                 }
 
                 /*
-                 * Generate a fake join tuple with nulls for the outer tuple,
-                 * and return it if it passes the non-join quals.
+                 * 【生成空值填充元组】
+                 * 为未匹配的内关系元组生成虚拟连接元组：
+                 *   - 内关系字段：保持原值
+                 *   - 外关系字段：全部填充为 NULL
+                 * 
+                 * 如果通过非连接条件过滤，则返回该元组
                  */
-                econtext->ecxt_outertuple = node->hj_NullOuterTupleSlot;
+                econtext->ecxt_outertuple = node->hj_NullOuterTupleSlot;  // 外关系全 NULL 的元组槽
 
                 if (otherqual == NIL || ExecQual(otherqual, econtext, false)) {
                     TupleTableSlot* result = NULL;
@@ -468,29 +733,51 @@ CREATE_HASH_TABLE:
 
                     if (isDone != ExprEndResult) {
                         node->js.ps.ps_vec_TupFromTlist = (isDone == ExprMultipleResult);
-                        return result;
+                        return result;  // 返回空值填充的连接结果
                     }
-                } else
+                } else {
+                    /* 【条件过滤】统计被 otherqual 过滤的空值填充元组 */
                     InstrCountFiltered2(node, 1);
+                }
                 break;
 
             case HJ_NEED_NEW_BATCH:
-
                 /*
-                 * Try to advance to next batch.  Done if there are no more.
+                 * 【状态 6：开始新批次】
+                 * 
+                 * 尝试进入下一个批次处理
+                 * 
+                 * 背景知识：
+                 *   当哈希表过大无法全部放入内存时，采用批处理机制：
+                 *   1. 将内关系和外关系都分区（partition）成多个批次
+                 *   2. 每次只处理一对对应的批次
+                 *   3. 批次数据存储在临时文件中
+                 *   4. 逐批处理直到所有批次完成
+                 * 
+                 * 返回值：
+                 *   true: 成功进入下一批次
+                 *   false: 所有批次都已处理完毕，连接结束
                  */
                 if (!ExecHashJoinNewBatch(node)) {
+                    /*
+                     * 【连接完成】
+                     * 没有更多批次了，整个哈希连接执行完毕
+                     * 
+                     * 执行早期资源释放，回收外关系占用的资源
+                     */
                     ExecEarlyFree(outerPlanState(node));
                     EARLY_FREE_LOG(elog(LOG, "Early Free: HashJoin Probe is done"
                         " at node %d, memory used %d MB.",
                         (node->js.ps.plan)->plan_node_id, getSessionMemoryUsageMB()));
 
-                    return NULL; /* end of join */
+                    return NULL;  /* 连接结束 */
                 }
+                /* 【成功进入下一批次】重置状态，开始处理新的外关系元组 */
                 node->hj_JoinState = HJ_NEED_NEW_OUTER;
                 break;
 
             default:
+                /* 【错误处理】遇到未知状态，抛出异常 */
                 ereport(ERROR, (errcode(ERRCODE_UNEXPECTED_NODE_STATE),
                         errmodule(MOD_EXECUTOR), errmsg("unrecognized hashjoin state: %d", (int)node->hj_JoinState)));
         }
