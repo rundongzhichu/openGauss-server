@@ -1,11 +1,31 @@
 /* -------------------------------------------------------------------------
  *
  * deadlock.cpp
- *	  openGauss deadlock detection code
+ *	  openGauss 死锁检测代码
+ *    【核心作用】检测并解决数据库中的死锁情况，保证系统不会因循环等待而挂起
  *
- * See src/backend/storage/lmgr/README for a description of the deadlock
- * detection and resolution algorithms.
+ * 死锁检测算法:
+ *   1. 构建等待图（waits-for graph）
+ *      - 节点：持有锁的事务/进程
+ *      - 边：事务 A 等待事务 B 释放锁
+ *   2. 检测图中是否存在环
+ *      - 有环 = 死锁
+ *      - 无环 = 无死锁
+ *   3. 选择牺牲者：打破环的最小代价方式
+ *      - 通常选择最年轻的事务或持有最少资源的事务
+ *   4. 回滚牺牲者，解除死锁
  *
+ * 关键数据结构:
+ *   - EDGE: 等待图中的一条边（等待者、阻塞者、锁对象）
+ *   - WAIT_ORDER: 锁等待队列的潜在重排序方案
+ *   - DEADLOCK_INFO: 死锁循环中每条边的详细信息（用于诊断输出）
+ *
+ * 性能优化:
+ *   - 限制递归深度防止栈溢出
+ *   - 超时检测（超过 10 分钟报错）
+ *   - 预分配工作内存避免在信号处理函数中分配
+ *
+ * 参考文档：src/backend/storage/lmgr/README
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -15,8 +35,8 @@
  * IDENTIFICATION
  *	  src/gausskernel/storage/lmgr/deadlock.cpp
  *
- *	Interface provided here: DeadLockCheck(), DeadLockReport()
- *	Interface provided here: RememberSimpleDeadLock(), InitDeadLockChecking()
+ *	对外接口：DeadLockCheck(), DeadLockReport()
+ *	        RememberSimpleDeadLock(), InitDeadLockChecking()
  *
  * -------------------------------------------------------------------------
  */
@@ -174,41 +194,58 @@ void InitDeadLockChecking(void)
     MemoryContextSwitchTo(oldcxt);
 }
 
-/*
- * DeadLockCheck -- Checks for deadlocks for a given process
- *
- * This code looks for deadlocks involving the given process.  If any
- * are found, it tries to rearrange lock wait queues to resolve the
- * deadlock.  If resolution is impossible, return DS_HARD_DEADLOCK ---
- * the caller is then expected to abort the given proc's transaction.
- *
- * Caller must already have locked all partitions of the lock tables.
- *
- * On failure, deadlock details are recorded in deadlockDetails[] for
- * subsequent printing by DeadLockReport().  That activity is separate
- * because (a) we don't want to do it while holding all those LWLocks,
- * and (b) we are typically invoked inside a signal handler.
+/* ----------------
+ *		DeadLockCheck
+ *     死锁检测主函数
+ * 
+ * 【功能说明】检查给定进程是否陷入死锁，并尝试通过重排锁等待队列来解决
+ * 
+ * 【参数说明】
+ *     proc: 要检查的进程（当前被阻塞的进程）
+ * 
+ * 【返回值】
+ *     DS_NO_DEADLOCK: 无死锁
+ *     DS_SOFT_DEADLOCK: 软死锁（可通过重排队列解决）
+ *     DS_HARD_DEADLOCK: 硬死锁（必须回滚事务）
+ *     DS_BLOCKED_BY_AUTOVACUUM: 被自动清理阻塞
+ *     DS_BLOCKED_BY_REDISTRIBUTION: 被数据重分布阻塞
+ * 
+ * 【算法流程】
+ *   1. 初始化约束条件（无约束状态）
+ *   2. 递归搜索死锁（DeadLockCheckRecurse）
+ *   3. 如果发现死锁：
+ *      - 记录死锁详细信息
+ *      - 尝试重排等待队列
+ *   4. 应用队列重排（如果找到解决方案）
+ *   5. 唤醒可能被解除阻塞的进程
+ * 
+ * 【设计要点】
+ *     - 调用者必须已经锁定所有锁表分区
+ *     - 在信号处理函数中调用，因此不能分配内存
+ *     - 超时保护：超过 10 分钟报错
+ *     - 详细诊断信息保存在 deadlockDetails[] 中供后续报告
+ * ----------------
  */
 DeadLockState DeadLockCheck(PGPROC *proc)
 {
     int i, j;
 
-    /* Initialize to "no constraints" */
+    /* 初始化为"无约束"状态 */
     t_thrd.storage_cxt.nCurConstraints = 0;
     t_thrd.storage_cxt.nPossibleConstraints = 0;
     t_thrd.storage_cxt.nWaitOrders = 0;
 
-    /* Initialize to not blocked by an autovacuum worker */
+    /* 初始化：未被自动清理工作进程阻塞 */
     t_thrd.storage_cxt.blocking_autovacuum_proc_num = 0;
 
-    /* Initialize starting time */
+    /* 记录开始时间（用于超时检测） */
     t_thrd.storage_cxt.deadlock_checker_start_time = GetCurrentTimestamp();
 
-    /* Search for deadlocks and possible fixes */
+    /* 搜索死锁并尝试修复 */
     if (DeadLockCheckRecurse(proc)) {
         /*
-         * Call FindLockCycle one more time, to record the correct
-         * deadlockDetails[] for the basic state with no rearrangements.
+         * 再次调用 FindLockCycle，记录正确的死锁详细信息
+         * （没有重排的基本状态）
          */
         int nSoftEdges;
 
@@ -219,10 +256,10 @@ DeadLockState DeadLockCheck(PGPROC *proc)
             elog(FATAL, "deadlock seems to have disappeared");
         }
 
-        return DS_HARD_DEADLOCK; /* cannot find a non-deadlocked state */
+        return DS_HARD_DEADLOCK; /* 无法找到非死锁状态 */
     }
 
-    /* Apply any needed rearrangements of wait queues */
+    /* 应用任何需要的等待队列重排 */
     for (i = 0; i < t_thrd.storage_cxt.nWaitOrders; i++) {
         LOCK *lock = t_thrd.storage_cxt.waitOrders[i].lock;
         PGPROC **procs = t_thrd.storage_cxt.waitOrders[i].procs;
@@ -235,7 +272,7 @@ DeadLockState DeadLockCheck(PGPROC *proc)
         PrintLockQueue(lock, "DeadLockCheck:");
 #endif
 
-        /* Reset the queue and re-add procs in the desired order */
+        /* 重置队列并按期望顺序重新添加进程 */
         ProcQueueInit(waitQueue);
         for (j = 0; j < nProcs; j++) {
             SHMQueueInsertBefore(&(waitQueue->links), &(procs[j]->links));
@@ -246,11 +283,11 @@ DeadLockState DeadLockCheck(PGPROC *proc)
         PrintLockQueue(lock, "rearranged to:");
 #endif
 
-        /* See if any waiters for the lock can be woken up now */
+        /* 查看锁的等待者是否可以被唤醒 */
         ProcLockWakeup(GetLocksMethodTable(lock), lock);
     }
 
-    /* Return code tells caller if we had to escape a deadlock or not */
+    /* 返回代码告诉调用者是否需要从死锁中逃脱 */
     if (t_thrd.storage_cxt.nWaitOrders > 0)
         return DS_SOFT_DEADLOCK;
     else if (t_thrd.storage_cxt.blocking_autovacuum_proc_num > 0)

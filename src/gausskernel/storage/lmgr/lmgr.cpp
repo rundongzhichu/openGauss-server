@@ -1,7 +1,29 @@
 /* -------------------------------------------------------------------------
  *
  * lmgr.cpp
- *	  openGauss lock manager code
+ *	  openGauss 锁管理器代码
+ *    【核心作用】提供数据库的锁管理功能，支持多种锁模式和锁粒度，保证并发访问的正确性
+ *
+ * 主要功能:
+ *   - 关系锁管理：表级、分区级、页面级锁
+ *   - 事务锁管理：行级锁、元组锁
+ *   - 死锁检测与处理
+ *   - 锁升级（从行锁升级到表锁）
+ *   - 锁超时处理
+ *
+ * 锁模式 (LOCKMODE):
+ *   - NoLock: 无锁
+ *   - AccessShareLock: 访问共享锁（SELECT 时获取）
+ *   - RowShareLock: 行共享锁（SELECT FOR UPDATE/FOR SHARE）
+ *   - RowExclusiveLock: 行排他锁（INSERT/UPDATE/DELETE）
+ *   - ShareUpdateExclusiveLock: 共享更新排他锁（VACUUM/CREATE INDEX CONCURRENTLY）
+ *   - ShareLock: 共享锁（CREATE INDEX）
+ *   - ShareRowExclusiveLock: 共享行排他锁（某些 ALTER TABLE 操作）
+ *   - ExclusiveLock: 排他锁（ALTER TABLE 等）
+ *   - AccessExclusiveLock: 访问排他锁（DROP TABLE/TRUNCATE，最强锁）
+ *
+ * 兼容性矩阵:
+ *   锁模式越弱，兼容性越好；锁模式越强，并发性越差但安全性越高
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -27,11 +49,20 @@
 #include "utils/inval.h"
 
 #define PARTITION_RETRY_LOCK_WAIT_INTERVAL 50000 /* 50 ms */
-/*
- * RelationInitLockInfo
- *		Initializes the lock information in a relation descriptor.
- *
- *		relcache.c must call this during creation of any reldesc.
+/* ----------------
+ *		RelationInitLockInfo
+ *     初始化关系描述符中的锁信息
+ * 
+ * 【功能说明】在创建任何关系描述符（reldesc）时，relcache.c 必须调用此函数
+ * 
+ * 【参数说明】
+ *     relation: 要初始化的关系描述符
+ * 
+ * 【设计要点】
+ *     - 设置锁关系的唯一标识（relId, dbId, bktId）
+ *     - 共享关系使用 InvalidOid 作为 dbId
+ *     - 普通关系使用当前数据库 ID
+ * ----------------
  */
 void RelationInitLockInfo(Relation relation)
 {
@@ -47,9 +78,20 @@ void RelationInitLockInfo(Relation relation)
     relation->rd_lockInfo.lockRelId.bktId = InvalidOid;
 }
 
-/*
- * SetLocktagRelationOid
- *		Set up a locktag for a relation, given only relation OID
+/* ----------------
+ *		SetLocktagRelationOid
+ *     根据关系 OID 设置锁标签
+ * 
+ * 【功能说明】为给定关系 OID 构造锁标签（LOCKTAG），用于锁管理器识别
+ * 
+ * 【参数说明】
+ *     tag: 输出的锁标签结构
+ *     relid: 关系的 OID
+ * 
+ * 【设计要点】
+ *     - 共享关系不需要数据库 ID
+ *     - 普通关系需要绑定到当前数据库
+ * ----------------
  */
 static inline void SetLocktagRelationOid(LOCKTAG *tag, Oid relid)
 {
@@ -63,11 +105,21 @@ static inline void SetLocktagRelationOid(LOCKTAG *tag, Oid relid)
     SET_LOCKTAG_RELATION(*tag, dbid, relid);
 }
 
-/*
+/* ----------------
  *		LockRelationOid
- *
- * Lock a relation given only its OID.	This should generally be used
- * before attempting to open the relation's relcache entry.
+ *     根据关系 OID 加锁
+ * 
+ * 【功能说明】仅通过关系 OID 对关系加锁，通常在尝试打开关系的 relcache 条目之前使用
+ * 
+ * 【参数说明】
+ *     relid: 关系的 OID
+ *     lockmode: 锁模式（如 AccessShareLock, RowExclusiveLock 等）
+ * 
+ * 【设计要点】
+ *     - 获取锁后检查失效消息，确保 relcache 是最新的
+ *     - RangeVarGetRelid() 依赖此行为
+ *     - 如果已经持有相同类型的锁，可以跳过失效检查
+ * ----------------
  */
 void LockRelationOid(Oid relid, LOCKMODE lockmode)
 {
@@ -77,27 +129,37 @@ void LockRelationOid(Oid relid, LOCKMODE lockmode)
     SetLocktagRelationOid(&tag, relid);
     res = LockAcquire(&tag, lockmode, false, false);
     /*
-     * Now that we have the lock, check for invalidation messages, so that we
-     * will update or flush any stale relcache entry before we try to use it.
-     * RangeVarGetRelid() specifically relies on us for this.  We can skip
-     * this in the not-uncommon case that we already had the same type of lock
-     * being requested, since then no one else could have modified the
-     * relcache entry in an undesirable way.  (In the case where our own xact
-     * modifies the rel, the relcache update happens via
-     * CommandCounterIncrement, not here.)
+     * 现在我们已经获得了锁，检查失效消息，这样在尝试使用关系之前
+     * 我们将更新或清除任何过时的 relcache 条目。
+     * RangeVarGetRelid() 专门依赖于此功能。
+     * 如果我们已经持有相同类型的锁，则可以跳过此步骤，
+     * 因为那样其他人无法以不希望的方式修改 relcache 条目。
+     * （在我们自己的事务修改关系的情况下，relcache 更新通过
+     * CommandCounterIncrement 发生，而不是在这里。）
      */
     if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 }
 
-/*
+/* ----------------
  *		ConditionalLockRelationOid
- *
- * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
- *
- * NOTE: we do not currently need conditional versions of all the
- * LockXXX routines in this file, but they could easily be added if needed.
+ *     条件加锁（不阻塞）
+ * 
+ * 【功能说明】与 LockRelationOid 类似，但只在不会阻塞的情况下加锁
+ * 
+ * 【参数说明】
+ *     relid: 关系的 OID
+ *     lockmode: 锁模式
+ * 
+ * 【返回值】
+ *     TRUE: 成功获得锁
+ *     FALSE: 无法立即获得锁（被其他事务持有）
+ * 
+ * 【设计要点】
+ *     - 避免长时间等待的乐观场景
+ *     - 批量操作中快速跳过不可用的资源
+ *     - 获取锁后同样需要检查失效消息
+ * ----------------
  */
 bool ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
 {
@@ -112,8 +174,7 @@ bool ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
     }
 
     /*
-     * Now that we have the lock, check for invalidation messages; see notes
-     * in LockRelationOid.
+     * 现在我们已经获得了锁，检查失效消息；参见 LockRelationOid 中的注释
      */
     if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
@@ -121,11 +182,20 @@ bool ConditionalLockRelationOid(Oid relid, LOCKMODE lockmode)
     return true;
 }
 
-/*
+/* ----------------
  *		UnlockRelationId
- *
- * Unlock, given a LockRelId.  This is preferred over UnlockRelationOid
- * for speed reasons.
+ *     根据 LockRelId 解锁
+ * 
+ * 【功能说明】释放已持有的关系锁，使用 LockRelId 比使用 OID 更快
+ * 
+ * 【参数说明】
+ *     relid: 锁关系标识符（包含 dbId 和 relId）
+ *     lockmode: 要释放的锁模式
+ * 
+ * 【设计要点】
+ *     - 优先使用此函数而非 UnlockRelationOid，避免重复查找
+ *     - 必须与加锁时使用相同的锁模式
+ * ----------------
  */
 void UnlockRelationId(LockRelId *relid, LOCKMODE lockmode)
 {
@@ -136,10 +206,20 @@ void UnlockRelationId(LockRelId *relid, LOCKMODE lockmode)
     (void)LockRelease(&tag, lockmode, false);
 }
 
-/*
+/* ----------------
  *		UnlockRelationOid
- *
- * Unlock, given only a relation Oid.  Use UnlockRelationId if you can.
+ *     根据关系 OID 解锁
+ * 
+ * 【功能说明】仅通过关系 OID 释放锁
+ * 
+ * 【参数说明】
+ *     relid: 关系的 OID
+ *     lockmode: 要释放的锁模式
+ * 
+ * 【设计要点】
+ *     - 性能低于 UnlockRelationId，因为需要重新构造锁标签
+ *     - 建议在无法获取 LockRelId 时使用
+ * ----------------
  */
 void UnlockRelationOid(Oid relid, LOCKMODE lockmode)
 {
@@ -150,10 +230,24 @@ void UnlockRelationOid(Oid relid, LOCKMODE lockmode)
     (void)LockRelease(&tag, lockmode, false);
 }
 
-/*
- * CheckLockRelationOid
- *
- * Check if a relation is locked, given only a relation Oid.
+/* ----------------
+ *		CheckLockRelationOid
+ *     检查关系是否已被锁定
+ * 
+ * 【功能说明】根据关系 OID 检查指定模式的锁是否存在
+ * 
+ * 【参数说明】
+ *     relid: 关系的 OID
+ *     lockmode: 要检查的锁模式
+ * 
+ * 【返回值】
+ *     TRUE: 关系已被指定模式的锁锁定
+ *     FALSE: 关系未被锁定
+ * 
+ * 【应用场景】
+ *     - 调试和诊断
+ *     - 避免重复加锁的检查逻辑
+ * ----------------
  */
 bool CheckLockRelationOid(Oid relid, LOCKMODE lockmode)
 {
@@ -165,12 +259,21 @@ bool CheckLockRelationOid(Oid relid, LOCKMODE lockmode)
 }
 
 
-/*
+/* ----------------
  *		LockRelation
- *
- * This is a convenience routine for acquiring an additional lock on an
- * already-open relation.  Never try to do "relation_open(foo, NoLock)"
- * and then lock with this.
+ *     对已打开的关系加锁
+ * 
+ * 【功能说明】为已经打开的关系描述符获取额外的锁
+ * 
+ * 【参数说明】
+ *     relation: 已打开的关系描述符
+ *     lockmode: 锁模式
+ * 
+ * 【设计要点】
+ *     - 直接使用关系描述符中已有的锁信息，避免重复查找
+ *     - 获取锁后检查失效消息，确保元数据最新
+ *     - 不应与 relation_open(foo, NoLock) 配合使用
+ * ----------------
  */
 void LockRelation(Relation relation, LOCKMODE lockmode)
 {
@@ -181,19 +284,30 @@ void LockRelation(Relation relation, LOCKMODE lockmode)
 
     res = LockAcquire(&tag, lockmode, false, false);
     /*
-     * Now that we have the lock, check for invalidation messages; see notes
-     * in LockRelationOid.
+     * 现在我们已经获得了锁，检查失效消息；参见 LockRelationOid 中的注释
      */
     if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
 }
 
-/*
+/* ----------------
  *		ConditionalLockRelation
- *
- * This is a convenience routine for acquiring an additional lock on an
- * already-open relation.  Never try to do "relation_open(foo, NoLock)"
- * and then lock with this.
+ *     条件加锁于已打开的关系（不阻塞）
+ * 
+ * 【功能说明】为已打开的关系尝试获取额外的锁，如果不能立即获得则返回
+ * 
+ * 【参数说明】
+ *     relation: 已打开的关系描述符
+ *     lockmode: 锁模式
+ * 
+ * 【返回值】
+ *     TRUE: 成功获得锁
+ *     FALSE: 无法立即获得锁
+ * 
+ * 【设计要点】
+ *     - 非阻塞版本，适用于乐观并发场景
+ *     - 成功获得锁后仍需检查失效消息
+ * ----------------
  */
 bool ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
 {
@@ -207,8 +321,7 @@ bool ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
         return false;
 
     /*
-     * Now that we have the lock, check for invalidation messages; see notes
-     * in LockRelationOid.
+     * 现在我们已经获得了锁，检查失效消息；参见 LockRelationOid 中的注释
      */
     if (res != LOCKACQUIRE_ALREADY_HELD || DeepthInAcceptInvalidationMessageNotZero())
         AcceptInvalidationMessages();
@@ -216,11 +329,20 @@ bool ConditionalLockRelation(Relation relation, LOCKMODE lockmode)
     return true;
 }
 
-/*
+/* ----------------
  *		UnlockRelation
- *
- * This is a convenience routine for unlocking a relation without also
- * closing it.
+ *     解锁关系但不关闭
+ * 
+ * 【功能说明】释放关系上的锁，但保持关系描述符打开状态
+ * 
+ * 【参数说明】
+ *     relation: 已打开的关系描述符
+ *     lockmode: 要释放的锁模式
+ * 
+ * 【应用场景】
+ *     - 需要保留关系访问但释放锁的场景
+ *     - 通常与 LockRelation 配对使用
+ * ----------------
  */
 void UnlockRelation(Relation relation, LOCKMODE lockmode)
 {
@@ -231,10 +353,20 @@ void UnlockRelation(Relation relation, LOCKMODE lockmode)
     (void)LockRelease(&tag, lockmode, false);
 }
 
-/*
- * CheckLockRelation
- *
- * This is a convenience routine for checking if a relation is locked.
+/* ----------------
+ *		CheckLockRelation
+ *     检查关系是否已被锁定
+ * 
+ * 【功能说明】检查已打开的关系是否持有指定模式的锁
+ * 
+ * 【参数说明】
+ *     relation: 已打开的关系描述符
+ *     lockmode: 要检查的锁模式
+ * 
+ * 【返回值】
+ *     TRUE: 关系已被锁定
+ *     FALSE: 关系未被锁定
+ * ----------------
  */
 bool CheckLockRelation(Relation relation, LOCKMODE lockmode)
 {
@@ -246,6 +378,21 @@ bool CheckLockRelation(Relation relation, LOCKMODE lockmode)
 }
 
 
+/* ----------------
+ *		LockRelFileNode
+ *     对关系文件节点加锁
+ * 
+ * 【功能说明】基于 RelFileNode 结构对物理文件层面加锁
+ * 
+ * 【参数说明】
+ *     rnode: 关系文件节点（包含表空间、数据库、关系 ID）
+ *     lockmode: 锁模式
+ * 
+ * 【应用场景】
+ *     - 底层文件操作前的保护
+ *     - 不依赖关系描述符的直接文件访问
+ * ----------------
+ */
 void LockRelFileNode(const RelFileNode &rnode, LOCKMODE lockmode)
 {
     LOCKTAG tag;
@@ -255,6 +402,17 @@ void LockRelFileNode(const RelFileNode &rnode, LOCKMODE lockmode)
     (void)LockAcquire(&tag, lockmode, false, false);
 }
 
+/* ----------------
+ *		UnlockRelFileNode
+ *     解锁关系文件节点
+ * 
+ * 【功能说明】释放基于 RelFileNode 的物理文件锁
+ * 
+ * 【参数说明】
+ *     rnode: 关系文件节点
+ *     lockmode: 要释放的锁模式
+ * ----------------
+ */
 void UnlockRelFileNode(const RelFileNode &rnode, LOCKMODE lockmode)
 {
     LOCKTAG tag;
@@ -439,15 +597,25 @@ void UnlockPackageIdForXact(Oid packageId, Oid dbId, LOCKMODE lockmode)
     (void)LockRelease(&tag, lockmode, false);
 }
 
-/*
+/* ----------------
  *		LockRelationForExtension
- *
- * This lock tag is used to interlock addition of pages to relations.
- * We need such locking because bufmgr/smgr definition of P_NEW is not
- * race-condition-proof.
- *
- * We assume the caller is already holding some type of regular lock on
- * the relation, so no AcceptInvalidationMessages call is needed here.
+ *     为关系扩展加锁
+ * 
+ * 【功能说明】在对关系添加新页面时进行互斥锁定，防止竞态条件
+ * 
+ * 【参数说明】
+ *     relation: 要扩展的关系
+ *     lockmode: 锁模式（通常为 ExclusiveLock）
+ * 
+ * 【设计要点】
+ *     - 解决 bufmgr/smgr 中 P_NEW 定义的竞态问题
+ *     - 调用者应已持有关系的常规锁
+ *     - 不需要检查失效消息
+ * 
+ * 【应用场景】
+ *     - 表增长时分配新数据页
+ *     - 索引扩展时添加新分支页
+ * ----------------
  */
 void LockRelationForExtension(Relation relation, LOCKMODE lockmode)
 {
@@ -461,11 +629,24 @@ void LockRelationForExtension(Relation relation, LOCKMODE lockmode)
     (void)LockAcquire(&tag, lockmode, false, false);
 }
 
-/*
+/* ----------------
  *		ConditionalLockRelationForExtension
- *
- * As above, but only lock if we can get the lock without blocking.
- * Returns TRUE iff the lock was acquired.
+ *     条件扩展锁（不阻塞）
+ * 
+ * 【功能说明】尝试获取关系扩展锁，如果不能立即获得则返回
+ * 
+ * 【参数说明】
+ *     relation: 要扩展的关系
+ *     lockmode: 锁模式
+ * 
+ * 【返回值】
+ *     TRUE: 成功获得扩展锁
+ *     FALSE: 无法立即获得锁
+ * 
+ * 【应用场景】
+ *     - 乐观的表扩展策略
+ *     - 避免在扩展操作上长时间等待
+ * ----------------
  */
 bool ConditionalLockRelationForExtension(Relation relation, LOCKMODE lockmode)
 {
@@ -529,11 +710,26 @@ void UnlockRelFileNodeForExtension(const RelFileNode &rnode, LOCKMODE lockmode)
     (void)LockRelease(&tag, lockmode, false);
 }
 
-/*
+/* ----------------
  *		LockPage
- *
- * Obtain a page-level lock.  This is currently used by some index access
- * methods to lock individual index pages.
+ *     页面级加锁
+ * 
+ * 【功能说明】获取特定数据页或索引页的锁
+ * 
+ * 【参数说明】
+ *     relation: 所属的关系
+ *     blkno: 页面块号
+ *     lockmode: 锁模式
+ * 
+ * 【设计要点】
+ *     - 细粒度锁，提高并发性能
+ *     - 主要用于索引访问方法
+ *     - 锁标签包含完整的页面定位信息
+ * 
+ * 【应用场景】
+ *     - 索引页面的并发修改
+ *     - 特定数据页的独占访问
+ * ----------------
  */
 void LockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
 {
@@ -583,12 +779,29 @@ void UnlockPage(Relation relation, BlockNumber blkno, LOCKMODE lockmode)
     (void)LockRelease(&tag, lockmode, false);
 }
 
-/*
+/* ----------------
  *		LockTuple
- *
- * Obtain a tuple-level lock.  This is used in a less-than-intuitive fashion
- * because we can't afford to keep a separate lock in shared memory for every
- * tuple.  See heap_lock_tuple before using this!
+ *     元组级（行级）加锁
+ * 
+ * 【功能说明】获取特定元组（行）的锁，实现行级并发控制
+ * 
+ * 【参数说明】
+ *     relation: 所属的关系
+ *     tid: 元组标识符（ItemPointer）
+ *     lockmode: 锁模式
+ *     allow_con_update: 是否允许并发更新
+ *     waitSec: 等待超时时间（秒）
+ * 
+ * 【设计要点】
+ *     - 最细粒度的锁，开销较大
+ *     - 不能为每个元组维护独立的共享内存锁
+ *     - 使用时需参考 heap_lock_tuple 的实现
+ * 
+ * 【应用场景】
+ *     - SELECT FOR UPDATE/SHARE
+ *     - UPDATE/DELETE 操作的行锁定
+ *     - 高并发下的行级冲突处理
+ * ----------------
  */
 void LockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode, bool allow_con_update, int waitSec)
 {
@@ -662,12 +875,25 @@ void UnlockTuple(Relation relation, ItemPointer tid, LOCKMODE lockmode)
     (void)LockRelease(&tag, lockmode, false);
 }
 
-/*
+/* ----------------
  *		XactLockTableInsert
- *
- * Insert a lock showing that the given transaction ID is running ---
- * this is done when an XID is acquired by a transaction or subtransaction.
- * The lock can then be used to wait for the transaction to finish.
+ *     插入事务锁
+ * 
+ * 【功能说明】注册一个运行中的事务 ID，其他事务可等待此事务完成
+ * 
+ * 【参数说明】
+ *     xid: 事务 ID
+ * 
+ * 【设计要点】
+ *     - 当事务或子事务获取 XID 时调用
+ *     - 使用排他锁（ExclusiveLock）标记事务运行状态
+ *     - 锁的释放隐含在事务结束时
+ * 
+ * 【应用场景】
+ *     - 事务依赖等待
+ *     - 级联回滚判断
+ *     - 可见性判断辅助
+ * ----------------
  */
 void XactLockTableInsert(TransactionId xid)
 {
@@ -694,17 +920,28 @@ void XactLockTableDelete(TransactionId xid)
     (void)LockRelease(&tag, ExclusiveLock, false);
 }
 
-/*
+/* ----------------
  *		XactLockTableWait
- *
- * Wait for the specified transaction to commit or abort.
- *
- * Note that this does the right thing for subtransactions: if we wait on a
- * subtransaction, we will exit as soon as it aborts or its top parent commits.
- * It takes some extra work to ensure this, because to save on shared memory
- * the XID lock of a subtransaction is released when it ends, whether
- * successfully or unsuccessfully.	So we have to check if it's "still running"
- * and if so wait for its parent.
+ *     等待事务完成
+ * 
+ * 【功能说明】阻塞等待指定事务提交或回滚
+ * 
+ * 【参数说明】
+ *     xid: 要等待的事务 ID
+ *     allow_con_update: 是否允许并发更新
+ *     waitSec: 等待超时时间（秒）
+ * 
+ * 【设计要点】
+ *     - 正确处理子事务：等待子事务或其顶层父事务结束
+ *     - 子事务锁在结束时即释放，需检查是否仍在运行
+ *     - 如仍在运行，则继续等待其父事务
+ *     - 使用共享锁（ShareLock）进行等待
+ * 
+ * 【应用场景】
+ *     - 事务冲突解决
+ *     - 依赖事务的完成等待
+ *     - 快照隔离级别实现
+ * ----------------
  */
 void XactLockTableWait(TransactionId xid, bool allow_con_update, int waitSec)
 {
@@ -890,13 +1127,27 @@ ConditionalSubXactLockTableWait(TransactionId xid, SubTransactionId subxid)
     return true;
 }
 
-/*
+/* ----------------
  *		LockDatabaseObject
- *
- * Obtain a lock on a general object of the current database.  Don't use
- * this for shared objects (such as tablespaces).  It's unwise to apply it
- * to relations, also, since a lock taken this way will NOT conflict with
- * locks taken via LockRelation and friends.
+ *     数据库对象加锁
+ * 
+ * 【功能说明】对当前数据库中的一般对象加锁（非共享对象）
+ * 
+ * 【参数说明】
+ *     classid: 对象类 OID（pg_class 中的 OID）
+ *     objid: 对象 OID
+ *     objsubid: 对象子 ID（0 表示整个对象，>0 表示对象的子部分）
+ *     lockmode: 锁模式
+ * 
+ * 【设计要点】
+ *     - 不应用于共享对象（如表空间）
+ *     - 不应用于关系（与 LockRelation 不兼容）
+ *     - 获取锁后更新系统缓存
+ * 
+ * 【应用场景】
+ *     - 索引、序列、视图等对象的 DDL 操作
+ *     - 函数、类型等目录对象的修改
+ * ----------------
  */
 void LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmode)
 {
@@ -906,7 +1157,7 @@ void LockDatabaseObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmo
 
     (void)LockAcquire(&tag, lockmode, false, false);
 
-    /* Make sure syscaches are up-to-date with any changes we waited for */
+    /* 确保系统缓存与我们等待的更改保持同步 */
     AcceptInvalidationMessages();
 }
 
@@ -948,10 +1199,27 @@ void UnlockDatabaseObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lock
     (void)LockRelease(&tag, lockmode, false);
 }
 
-/*
+/* ----------------
  *		LockSharedObject
- *
- * Obtain a lock on a shared-across-databases object.
+ *     共享对象加锁
+ * 
+ * 【功能说明】对跨数据库共享的对象加锁
+ * 
+ * 【参数说明】
+ *     classid: 对象类 OID
+ *     objid: 对象 OID
+ *     objsubid: 对象子 ID
+ *     lockmode: 锁模式
+ * 
+ * 【设计要点】
+ *     - 使用 InvalidOid 作为 dbId，表示全局共享
+ *     - 获取锁后更新系统缓存
+ * 
+ * 【应用场景】
+ *     - 表空间操作
+ *     - 角色/用户管理
+ *     - 全局配置参数修改
+ * ----------------
  */
 void LockSharedObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmode)
 {
@@ -961,7 +1229,7 @@ void LockSharedObject(Oid classid, Oid objid, uint16 objsubid, LOCKMODE lockmode
 
     (void)LockAcquire(&tag, lockmode, false, false);
 
-    /* Make sure syscaches are up-to-date with any changes we waited for */
+    /* 确保系统缓存与我们等待的更改保持同步 */
     AcceptInvalidationMessages();
 }
 
@@ -1004,12 +1272,31 @@ void UnlockSharedObjectForSession(Oid classid, Oid objid, uint16 objsubid, LOCKM
     (void)LockRelease(&tag, lockmode, true);
 }
 
-/*
- * Append a description of a lockable object to buf.
- *
- * Ideally we would print names for the numeric values, but that requires
- * getting locks on system tables, which might cause problems since this is
- * typically used to report deadlock situations.
+/* ----------------
+ *		DescribeLockTag
+ *     描述锁标签
+ * 
+ * 【功能说明】将锁标签的人类可读描述追加到缓冲区
+ * 
+ * 【参数说明】
+ *     buf: 输出字符串缓冲区
+ *     tag: 锁标签结构
+ * 
+ * 【设计要点】
+ *     - 支持所有锁类型（关系、页面、元组、事务、对象等）
+ *     - 理想情况下应打印名称而非数字，但为避免死锁报告时的递归锁问题
+ *       直接输出 OID 数值
+ *     - 常用于死锁检测和锁等待诊断
+ * 
+ * 【支持的锁类型】
+ *     - LOCKTAG_RELATION: 关系锁
+ *     - LOCKTAG_PAGE: 页面锁
+ *     - LOCKTAG_TUPLE: 元组锁
+ *     - LOCKTAG_TRANSACTION: 事务锁
+ *     - LOCKTAG_OBJECT: 数据库对象锁
+ *     - LOCKTAG_PARTITION: 分区锁
+ *     - 等等...
+ * ----------------
  */
 void DescribeLockTag(StringInfo buf, const LOCKTAG *tag)
 {

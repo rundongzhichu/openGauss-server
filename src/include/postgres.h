@@ -1,10 +1,10 @@
 /* -------------------------------------------------------------------------
  *
  * postgres.h
- *	  Primary include file for PostgreSQL server .c files
+ *	  PostgreSQL 服务器 .c 文件的主要包含文件
+ *    【核心作用】这是 PostgreSQL 后端模块第一个需要包含的文件，定义了数据库系统的核心数据结构和宏
  *
- * This should be the first file included by PostgreSQL backend modules.
- * Client-side code should include postgres_fe.h instead.
+ * 注意：客户端代码应该包含 postgres_fe.h 而不是此文件
  *
  *
  * Portions Copyright (c) 2021, openGauss Contributors
@@ -18,28 +18,23 @@
  */
 /*
  * ----------------------------------------------------------------
- *	 TABLE OF CONTENTS
+ *	 目录
  *
- *		When adding stuff to this file, please try to put stuff
- *		into the relevant section, or add new sections as appropriate.
+ *		向此文件添加内容时，请尽量放入相关部分，或酌情添加新部分
  *
- *	  section	description
+ *	  部分编号	描述
  *	  -------	------------------------------------------------
- *		1)		variable-length datatypes (TOAST support)
- *		2)		datum type + support macros
- *		3)		exception handling definitions
+ *		1)		可变长度数据类型（TOAST 支持）
+ *		2)		datum 类型及支持宏
+ *		3)		异常处理定义
  *
- *	 NOTES
+ *	 说明
  *
- *	In general, this file should contain declarations that are widely needed
- *	in the backend environment, but are of no interest outside the backend.
+ *	一般来说，此文件应包含后端环境中广泛需要但在后端之外无用的声明
  *
- *	Simple type definitions live in c.h, where they are shared with
- *	postgres_fe.h.	We do that since those type definitions are needed by
- *	frontend modules that want to deal with binary data transmission to or
- *	from the backend.  Type definitions in this file should be for
- *	representations that never escape the backend, such as Datum or
- *	TOASTed varlena objects.
+ *	简单的类型定义位于 c.h 中，与 postgres_fe.h 共享
+ *	这样做是因为那些类型定义也需要用于前端模块以处理与后端的二进制数据传输
+ *	此文件中的类型定义应仅用于从不逃逸后端的表示形式，如 Datum 或 TOASTed varlena 对象
  *
  * ----------------------------------------------------------------
  */

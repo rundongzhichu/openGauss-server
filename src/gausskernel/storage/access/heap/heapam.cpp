@@ -1,7 +1,8 @@
 /* -------------------------------------------------------------------------
  *
  * heapam.cpp
- *	  heap access method code
+ *	  堆表访问方法代码
+ *    【核心作用】实现 openGauss 的堆表存储引擎，提供表的增删改查等基础操作
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -13,30 +14,29 @@
  *	  src/gausskernel/storage/access/heap/heapam.cpp
  *
  *
- * INTERFACE ROUTINES
- *		relation_open	- open any relation by relation OID
- *		relation_openrv - open any relation specified by a RangeVar
- *		relation_close	- close any relation
- *		heap_open		- open a heap relation by relation OID
- *		heap_openrv		- open a heap relation specified by a RangeVar
- *		heap_close		- (now just a macro for relation_close)
- *		heap_beginscan	- begin relation scan
- *		heap_rescan		- restart a relation scan
- *		heap_endscan	- end relation scan
- *		heap_getnext	- retrieve next tuple in scan
- *		heap_fetch		- retrieve tuple with given tid
- *		heap_insert		- insert tuple into a relation
- *		heap_multi_insert - insert multiple tuples into a relation
- *		heap_delete		- delete a tuple from a relation
- *		heap_update		- replace a tuple in a relation with another tuple
- *		heap_markpos	- mark scan position
- *		heap_restrpos	- restore position to marked location
- *		heap_sync		- sync heap, for when no WAL has been written
+ * 接口函数:
+ *		relation_open	   - 通过关系 OID 打开任意关系
+ *		relation_openrv    - 通过 RangeVar 打开任意关系
+ *		relation_close	   - 关闭任意关系
+ *		heap_open		   - 通过关系 OID 打开堆表
+ *		heap_openrv		   - 通过 RangeVar 打开堆表
+ *		heap_close		   - 关闭堆表（现在是 relation_close 的宏）
+ *		heap_beginscan	   - 开始关系扫描
+ *		heap_rescan		   - 重新开始关系扫描
+ *		heap_endscan	   - 结束关系扫描
+ *		heap_getnext	   - 获取扫描中的下一个元组
+ *		heap_fetch		   - 根据 tid 检索元组
+ *		heap_insert		   - 向关系中插入元组
+ *		heap_multi_insert  - 向关系中批量插入多个元组
+ *		heap_delete		   - 从关系中删除元组
+ *		heap_update		   - 用新元组替换关系中的元组
+ *		heap_markpos	   - 标记扫描位置
+ *		heap_restrpos	   - 恢复扫描位置到标记处
+ *		heap_sync		   - 同步堆表（当没有写入 WAL 时）
  *
- * NOTES
- *	  This file contains the heap_ routines which implement
- *	  the openGauss heap access method used for all POSTGRES
- *	  relations.
+ * 说明:
+ *	  此文件包含实现堆访问方法的 heap_ 系列函数
+ *	  用于所有 POSTGRES 关系的底层存储管理
  *
  * -------------------------------------------------------------------------
  */
@@ -158,7 +158,31 @@ static void GetMultiXactIdHintBits(MultiXactId multi, uint16 *new_infomask, uint
 static bool DoesMultiXactIdConflict(MultiXactId multi, LockTupleMode lockmode);
 
 /* ----------------
- *		initscan - scan code common to heap_beginscan and heap_rescan
+ *		InitScanBlocks - 初始化堆表扫描的块相关信息
+ * 
+ * 【功能说明】
+ *     初始化堆表扫描的块相关信息，包括：
+ *     1. 确定需要扫描的数据块数量
+ *     2. 设置起始块位置
+ *     3. 处理分区表、并行扫描、Redis 范围扫描等特殊情况
+ * 
+ * 【参数说明】
+ *     scan: 堆扫描描述符，包含扫描状态和信息
+ *     rangeScanInRedis: Redis 范围扫描标识和分片信息
+ *       - isRangeScanInRedis: 是否为 Redis 范围扫描
+ *       - sliceTotal: 总分片数
+ *       - sliceIndex: 当前分片索引
+ * 
+ * 【设计要点】
+ *     1. 快照一致性：在扫描开始时一次性确定块数即可，因为扫描过程中添加的元组
+ *        对当前快照不可见（MVCC 机制保证）
+ *     2. 非 MVCC 快照注意事项：对于非 MVCC 快照，无法保证返回扫描开始后添加的元组，
+ *        因为它们可能进入已扫描过的页面。要保证一致性，调用者必须持有更高级别的锁
+ *     3. 多场景支持：
+ *        - 分区表：设置初始值为 InvalidBlockNumber，实际值在 BitmapHeapTblNext 中更新
+ *        - 并行扫描：使用预计算的块数 (phs_nblocks)
+ *        - Redis 范围扫描：根据 CTID 范围和分片信息计算精确的扫描范围
+ *     4. 日志记录：对于 Redis 范围扫描，记录详细的扫描范围信息便于调试
  * ----------------
  */
 static inline void InitScanBlocks(HeapScanDesc scan, RangeScanInRedis rangeScanInRedis)
@@ -166,36 +190,64 @@ static inline void InitScanBlocks(HeapScanDesc scan, RangeScanInRedis rangeScanI
     BlockNumber nblocks;
 
     /*
-     * Determine the number of blocks we have to scan.
+     * 确定需要扫描的数据块数量
      *
-     * It is sufficient to do this once at scan start, since any tuples added
-     * while the scan is in progress will be invisible to my snapshot anyway.
-     * (That is not true when using a non-MVCC snapshot.  However, we couldn't
-     * guarantee to return tuples added after scan start anyway, since they
-     * might go into pages we already scanned.	To guarantee consistent
-     * results for a non-MVCC snapshot, the caller must hold some higher-level
-     * lock that ensures the interesting tuple(s) won't change.)
+     * 在扫描开始时计算一次就足够了，因为扫描过程中添加的任何元组
+     * 对我的快照来说都是不可见的（MVCC 机制保证）。
+     *
+     * 注意：使用非 MVCC 快照时情况不同。但是，即使那样我们也无法保证
+     * 返回扫描开始后添加的元组，因为它们可能进入我们已经扫描过的页面。
+     * 要为非 MVCC 快照保证一致的结果，调用者必须持有某种更高级别的锁，
+     * 确保感兴趣的元组不会改变。
      */
     if (RelationIsPartitioned(scan->rs_base.rs_rd)) {
-        /*  partition table just set Initial Value, in BitmapHeapTblNext will update */
+        /* 
+         * 分区表特殊处理：
+         * 只设置初始值为无效块号，实际的块数将在 BitmapHeapTblNext 中动态更新
+         * 这是因为分区表的块数可能在扫描过程中发生变化
+         */
         nblocks = InvalidBlockNumber;
     } else if (scan->rs_parallel != NULL && scan->rs_parallel->isplain) {
+        /* 
+         * 并行普通堆扫描：
+         * 使用并行扫描描述符中预计算的块数，避免重复计算
+         */
         nblocks = scan->rs_parallel->phs_nblocks;
     }
     else {
+        /* 
+         * 常规情况：
+         * 直接获取关系的总块数
+         */
         nblocks = RelationGetNumberOfBlocks(scan->rs_base.rs_rd);
     }
+    
+    /* 
+     * 处理 Redis 范围扫描的特殊逻辑
+     * 当启用 Redis 范围扫描且表中有数据时，需要根据 CTID 范围精确计算扫描区间
+     */
     if (nblocks > 0 && rangeScanInRedis.isRangeScanInRedis) {
         ItemPointerData start_ctid;
         ItemPointerData end_ctid;
 
+        /* 获取关系的起始和结束 CTID（元组标识符），用于确定扫描范围 */
         RelationGetCtids(scan->rs_base.rs_rd, &start_ctid, &end_ctid);
+        
         if (rangeScanInRedis.sliceTotal <= 1) {
+            /* 
+             * 单分片情况：
+             * 扫描整个 CTID 范围，不需要分片
+             */
             Assert(rangeScanInRedis.sliceIndex == 0);
             scan->rs_base.rs_nblocks = RedisCtidGetBlockNumber(&end_ctid) - RedisCtidGetBlockNumber(&start_ctid) + 1;
             scan->rs_base.rs_startblock = RedisCtidGetBlockNumber(&start_ctid);
             scan->rs_base.rs_numblocks = 0;
         } else {
+            /* 
+             * 多分片情况：
+             * 根据分片总数和当前分片索引，计算本分片负责的扫描范围
+             * eval_redis_func_direct_slice 函数用于计算分片的起始和结束 CTID
+             */
             ItemPointer sctid = eval_redis_func_direct_slice(&start_ctid, &end_ctid, true,
                                                              rangeScanInRedis.sliceTotal,
                                                              rangeScanInRedis.sliceIndex);
@@ -206,10 +258,18 @@ static inline void InitScanBlocks(HeapScanDesc scan, RangeScanInRedis rangeScanI
             scan->rs_base.rs_nblocks    = RedisCtidGetBlockNumber(ectid) - scan->rs_base.rs_startblock + 1;
             scan->rs_base.rs_numblocks  = 0;
         }
+        /* 
+         * 记录日志以便调试和性能分析：
+         * 包括起始块、块数、起始/结束 CTID、分片信息等
+         */
         ereport(LOG, (errmsg("start block is %d, nblock is %d, start_ctid is %d, end_ctid is %d, sliceTotal is %d, "
             "sliceIndex is %d", scan->rs_base.rs_startblock, scan->rs_base.rs_nblocks, RedisCtidGetBlockNumber(&start_ctid),
             RedisCtidGetBlockNumber(&end_ctid), rangeScanInRedis.sliceTotal, rangeScanInRedis.sliceIndex)));
     } else {
+        /* 
+         * 非 Redis 扫描或空表情况：
+         * 使用默认设置，扫描所有块
+         */
         scan->rs_base.rs_nblocks = nblocks;
         scan->rs_base.rs_numblocks = 0;
     }

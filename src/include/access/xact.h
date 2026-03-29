@@ -1,8 +1,9 @@
 /* -------------------------------------------------------------------------
  *
  * xact.h
- *	  postgres transaction system definitions
- *
+ *	  PostgreSQL 事务系统定义
+ *    【核心作用】定义数据库事务管理的核心数据结构、状态枚举和回调机制
+ *    【主要功能】包括事务隔离级别、事务状态管理、XLOG 记录、回调函数等
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
@@ -31,124 +32,160 @@
 #include "threadpool/threadpool_worker.h"
 #include "access/ustore/undo/knl_uundotype.h"
 
+/*
+ * 事务 try-catch 块的状态枚举
+ * 用于跟踪事务中异常处理块的执行状态
+ */
 typedef enum {
-    TRY_CATCH_IN_TRY,
-    TRY_CATCH_TRY_FAILED,
-    TRY_CATCH_IN_CATCH,
-    TRY_CATCH_CATCH_IGNORED
+    TRY_CATCH_IN_TRY,           /* 正在执行 try 块 */
+    TRY_CATCH_TRY_FAILED,       /* try 块执行失败 */
+    TRY_CATCH_IN_CATCH,         /* 正在执行 catch 块 */
+    TRY_CATCH_CATCH_IGNORED     /* catch 块被忽略 */
 } TransactionTryCatchStatus;
 
+/*
+ * 事务 try-catch 上下文结构
+ * 保存事务异常处理的相关信息
+ */
 typedef struct TransactionTryCatchContext
 {
-    bool hasSavepoint;
-    ErrorData* edata;
-    TransactionTryCatchStatus status;
+    bool hasSavepoint;                      /* 是否有保存点 */
+    ErrorData* edata;                       /* 错误数据 */
+    TransactionTryCatchStatus status;       /* 当前状态 */
 } TransactionTryCatchContext;
 
 /*
- * Xact isolation levels
+ * 事务隔离级别定义
+ * openGauss 支持四种标准 SQL 隔离级别
+ * 隔离级别越高，数据一致性越好，但并发性能可能越低
  */
-#define XACT_READ_UNCOMMITTED 0
-#define XACT_READ_COMMITTED 1
-#define XACT_REPEATABLE_READ 2
-#define XACT_SERIALIZABLE 3
+#define XACT_READ_UNCOMMITTED 0     /* 读未提交：可能读到未提交的脏数据（最低隔离级别） */
+#define XACT_READ_COMMITTED 1       /* 读已提交：只能读到已提交的数据（默认级别） */
+#define XACT_REPEATABLE_READ 2      /* 可重复读：同一事务中多次读取结果一致 */
+#define XACT_SERIALIZABLE 3         /* 可串行化：最高隔离级别，完全串行执行效果 */
 
-#define SNAPSHOT_UPDATE_NEED_SYNC (1 << 0)
-#define SNAPSHOT_NOW_NEED_SYNC (1 << 1)
+/* 快照同步标志位 */
+#define SNAPSHOT_UPDATE_NEED_SYNC (1 << 0)  /* 更新快照需要同步 */
+#define SNAPSHOT_NOW_NEED_SYNC (1 << 1)     /* 当前快照需要同步 */
 
 /*
- * start- and end-of-transaction callbacks for dynamically loaded modules
+ * 动态加载模块的事务开始和结束回调函数
+ * 用于在事务生命周期各个阶段执行自定义逻辑
+ * 扩展模块可以注册这些回调来监控或干预事务处理过程
  */
 typedef enum {
-    XACT_EVENT_START,               // For MOT, callback will notify us about new transaction.
-    XACT_EVENT_COMMIT,
-    XACT_EVENT_END_TRANSACTION,
-    XACT_EVENT_RECORD_COMMIT,       // For MOT, to write redo and apply changes (after setCommitCsn).
-    XACT_EVENT_ABORT,
-    XACT_EVENT_PREPARE,
-    XACT_EVENT_COMMIT_PREPARED,
-    XACT_EVENT_ROLLBACK_PREPARED,
-    XACT_EVENT_PREROLLBACK_CLEANUP, // For MOT, to cleanup some internal resources.
-    XACT_EVENT_POST_COMMIT_CLEANUP, // For MOT, to cleanup some dropped function JIT sources.
-    XACT_EVENT_STMT_FINISH,          // For MOT, to notify end of statement.
-    /** The stage before XACT_EVENT_COMMIT. */
-    XACT_EVENT_PRE_COMMIT,
-    /** The stage before XACT_EVENT_PREPARE. */
-    XACT_EVENT_PRE_PREPARE
+    XACT_EVENT_START,               /* 事务开始：通知 MOT 有新事务 */
+    XACT_EVENT_COMMIT,              /* 事务提交：正式提交事务 */
+    XACT_EVENT_END_TRANSACTION,     /* 事务结束：事务完全结束 */
+    XACT_EVENT_RECORD_COMMIT,       /* 记录提交：MOT 写入 redo 并应用更改（在 setCommitCsn 之后） */
+    XACT_EVENT_ABORT,               /* 事务回滚：事务被中止 */
+    XACT_EVENT_PREPARE,             /* 事务预准备：两阶段提交的第一阶段 */
+    XACT_EVENT_COMMIT_PREPARED,     /* 提交预准备的事务：两阶段提交的第二阶段（提交） */
+    XACT_EVENT_ROLLBACK_PREPARED,   /* 回滚预准备的事务：两阶段提交的第二阶段（回滚） */
+    XACT_EVENT_PREROLLBACK_CLEANUP, /* 回滚前清理：清理 MOT 内部资源 */
+    XACT_EVENT_POST_COMMIT_CLEANUP, /* 提交后清理：清理 JIT 源等 dropped 函数 */
+    XACT_EVENT_STMT_FINISH,         /* 语句完成：通知语句结束 */
+    /** XACT_EVENT_COMMIT 之前的阶段 */
+    XACT_EVENT_PRE_COMMIT,          /* 预提交阶段：在正式提交之前 */
+    /** XACT_EVENT_PREPARE 之前的阶段 */
+    XACT_EVENT_PRE_PREPARE          /* 预准备阶段：在正式预准备之前 */
 } XactEvent;
 
+/* 事务回调函数类型定义 */
 typedef void (*XactCallback)(XactEvent event, void* arg);
 
+/*
+ * 子事务事件类型
+ * 用于保存点（SAVEPOINT）相关操作的通知
+ * 子事务允许在事务内部创建嵌套的事务边界
+ */
 typedef enum {
-    SUBXACT_EVENT_START_SUB,
-    SUBXACT_EVENT_COMMIT_SUB,
-    SUBXACT_EVENT_CLEANUP_SUB,
-    SUBXACT_EVENT_ABORT_SUB
+    SUBXACT_EVENT_START_SUB,        /* 开始子事务（创建保存点） */
+    SUBXACT_EVENT_COMMIT_SUB,       /* 提交子事务（释放保存点） */
+    SUBXACT_EVENT_CLEANUP_SUB,      /* 清理子事务资源 */
+    SUBXACT_EVENT_ABORT_SUB         /* 回滚子事务（回滚到保存点） */
 } SubXactEvent;
 
+/* 子事务回调函数类型定义 */
 typedef void (*SubXactCallback)(SubXactEvent event, SubTransactionId mySubid, SubTransactionId parentSubid, void* arg);
 
 #ifdef PGXC
 /*
- * GTM callback events
+ * GTM（全局事务管理器）回调事件
+ * 用于分布式环境下的全局事务协调
+ * GTM 负责管理全局事务 ID 和全局快照
  */
 typedef enum {
-    GTM_EVENT_COMMIT,
-    GTM_EVENT_ABORT,
-    GTM_EVENT_PREPARE
+    GTM_EVENT_COMMIT,               /* GTM 提交事件 */
+    GTM_EVENT_ABORT,                /* GTM 回滚事件 */
+    GTM_EVENT_PREPARE               /* GTM 预准备事件 */
 } GTMEvent;
 
+/* GTM 回调函数类型定义 */
 typedef void (*GTMCallback)(GTMEvent event, void* arg);
 #endif
 
 /*
- * We implement three isolation levels internally.
- * The two stronger ones use one snapshot per database transaction;
- * the others use one snapshot per statement.
- * Serializable uses predicate locks in addition to snapshots.
- * These macros should be used to check which isolation level is selected.
+ * 内部实现三种隔离级别
+ * 两种较强的级别（可重复读、可串行化）每个数据库事务使用一个快照
+ * 较弱的级别（读未提交、读已提交）每个语句使用一个快照
+ * 可串行化还使用谓词锁来保证完全的串行化效果
+ *
+ * 这些宏用于检查当前选择的隔离级别
  */
 #define IsolationUsesXactSnapshot() (u_sess->utils_cxt.XactIsoLevel >= XACT_REPEATABLE_READ)
 #define IsolationIsSerializable() (u_sess->utils_cxt.XactIsoLevel == XACT_SERIALIZABLE)
 
-extern THR_LOCAL bool TwoPhaseCommit;
+extern THR_LOCAL bool TwoPhaseCommit;  /* 是否启用两阶段提交 */
 
+/*
+ * 同步提交级别枚举
+ * 定义主备节点间数据同步的确认级别，影响数据可靠性和性能
+ * 级别越高，数据越安全，但性能开销越大
+ */
 typedef enum {
-    SYNCHRONOUS_COMMIT_OFF,            /* asynchronous commit */
-    SYNCHRONOUS_COMMIT_LOCAL_FLUSH,    /* wait for local flush only */
-    SYNCHRONOUS_COMMIT_REMOTE_RECEIVE, /* wait for local flush and remote receive */
-    SYNCHRONOUS_COMMIT_REMOTE_WRITE,   /* wait for local flush and remote write */
-    SYNCHRONOUS_COMMIT_REMOTE_FLUSH,   /* wait for local and remote flush */
-    SYNCHRONOUS_COMMIT_REMOTE_APPLY,  /* wait for local and remote replay */
-    SYNCHRONOUS_BAD
+    SYNCHRONOUS_COMMIT_OFF,            /* 异步提交：不等待备机确认（最快，可靠性最低） */
+    SYNCHRONOUS_COMMIT_LOCAL_FLUSH,    /* 等待本地刷盘：只等待本机 WAL 落盘 */
+    SYNCHRONOUS_COMMIT_REMOTE_RECEIVE, /* 等待远程接收：等待备机接收 WAL */
+    SYNCHRONOUS_COMMIT_REMOTE_WRITE,   /* 等待远程写入：等待备机写入 WAL */
+    SYNCHRONOUS_COMMIT_REMOTE_FLUSH,   /* 等待远程刷盘：等待备机 WAL 落盘（默认级别） */
+    SYNCHRONOUS_COMMIT_REMOTE_APPLY,   /* 等待远程回放：等待备机重做完成（最慢，可靠性最高） */
+    SYNCHRONOUS_BAD                    /* 无效值 */
 } SyncCommitLevel;
 
-/* Define the default setting for synchonous_commit */
+/* 定义 synchronous_commit 的默认设置 */
 #define SYNCHRONOUS_COMMIT_ON SYNCHRONOUS_COMMIT_REMOTE_FLUSH
 
 
 /* ----------------
- *		transaction-related XLOG entries
+ *		事务相关的 XLOG 记录定义
  * ----------------
+ * XLOG（Write-Ahead Log）是数据库的预写日志，用于保证事务的持久性和恢复能力
  */
 
 /*
- * XLOG allows to store some information in high 4 bits of log
- * record xl_info field
+ * XLOG 允许在日志记录的 xl_info 字段的高 4 位存储一些信息
+ * 这些标识符用于区分不同类型的事务日志记录
+ * 通过 subtype 可以快速识别日志记录的类型
  */
-#define XLOG_XACT_COMMIT 0x00
-#define XLOG_XACT_PREPARE 0x10
-#define XLOG_XACT_ABORT 0x20
-#define XLOG_XACT_COMMIT_PREPARED 0x30
-#define XLOG_XACT_ABORT_PREPARED 0x40
-#define XLOG_XACT_ASSIGNMENT 0x50
-#define XLOG_XACT_COMMIT_COMPACT 0x60
-#define XLOG_XACT_ABORT_WITH_XID 0x70
+#define XLOG_XACT_COMMIT 0x00           /* 事务提交日志 */
+#define XLOG_XACT_PREPARE 0x10          /* 事务预准备日志 */
+#define XLOG_XACT_ABORT 0x20            /* 事务回滚日志 */
+#define XLOG_XACT_COMMIT_PREPARED 0x30  /* 预准备事务提交日志 */
+#define XLOG_XACT_ABORT_PREPARED 0x40   /* 预准备事务回滚日志 */
+#define XLOG_XACT_ASSIGNMENT 0x50       /* 事务 ID 分配日志 */
+#define XLOG_XACT_COMMIT_COMPACT 0x60   /* 紧凑提交日志（优化版本） */
+#define XLOG_XACT_ABORT_WITH_XID 0x70   /* 带事务 ID 的回滚日志 */
 
+/*
+ * 事务分配日志记录结构
+ * 记录事务及其子事务的 ID 分配情况
+ * 用于在恢复时重建事务层次结构
+ */
 typedef struct xl_xact_assignment {
-    TransactionId xtop;    /* assigned XID's top-level XID */
-    int nsubxacts;         /* number of subtransaction XIDs */
-    TransactionId xsub[1]; /* assigned subxids */
+    TransactionId xtop;    /* 分配事务 ID 的顶层事务 ID */
+    int nsubxacts;         /* 子事务 ID 的数量 */
+    TransactionId xsub[1]; /* 分配的子事务 ID 数组（变长数组） */
 } xl_xact_assignment;
 
 typedef struct xl_xact_origin {
