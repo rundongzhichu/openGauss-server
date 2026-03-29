@@ -106,8 +106,35 @@ const uint32 ESTIMATED_MIN_BLOCKS = 10000;
  * Status of buffers to checkpoint for a particular tablespace, used
  * internally in BufferSync.
  */
+
+/* 
+ * 表空间检查点状态结构
+ * 用于 BufferSync 过程中跟踪每个表空间的检查点进度
+ * 
+ * 设计思想:
+ * - 多表空间并行检查点
+ * - 公平调度算法（避免某个表空间饿死）
+ * - 进度可量化（0 到总页数之间）
+ * 
+ * 工作原理:
+ * 1. 将所有表空间按进度排序（ts_ckpt_progress_comparator）
+ * 2. 每次选择进度最小的表空间处理
+ * 3. 每检查点一个页面，progress 增加 progress_slice
+ * 4. progress_slice = (num_to_scan > 0) ? 1.0 / num_to_scan : 0
+ *    即：每个页面贡献相等的进度比例
+ * 
+ * 示例:
+ * 表空间 A: 1000 页，progress_slice = 0.001
+ * 表空间 B: 5000 页，progress_slice = 0.0002
+ * 
+ * 处理 100 页后:
+ * A.progress = 100 * 0.001 = 0.1 (10%)
+ * B.progress = 100 * 0.0002 = 0.02 (2%)
+ * 
+ * 下次优先处理 B，保证公平性
+ */
 typedef struct CkptTsStatus {
-    /* oid of the tablespace */
+    /* oid of the tablespace: 表空间 OID */
     Oid tsId;
 
     /*
@@ -116,31 +143,174 @@ typedef struct CkptTsStatus {
      * number between 0 and the total number of to-be-checkpointed pages. Each
      * page checkpointed in this tablespace increments this space's progress
      * by progress_slice.
+     * 
+     * 检查点进度值
+     * 范围：0 到 1（归一化进度）
+     * 每次检查点增加 progress_slice
+     * 用于多表空间公平调度
      */
     float8 progress;
+    
+    /* 
+     * 进度分片值
+     * progress_slice = 1.0 / num_to_scan
+     * 表示每个页面对总进度的贡献
+     */
     float8 progress_slice;
 
-    /* number of to-be checkpointed pages in this tablespace */
+    /* number of to-be checkpointed pages in this tablespace: 待检查点的总页数 */
     int num_to_scan;
-    /* already processed pages in this tablespace */
+    
+    /* already processed pages in this tablespace: 已处理的页数 */
     int num_scanned;
 
-    /* current offset in CkptBufferIds for this tablespace */
+    /* 
+     * current offset in CkptBufferIds for this tablespace
+     * 当前在 CkptBufferIds 数组中的索引位置
+     * 用于循环扫描缓冲区
+     */
     int index;
 } CkptTsStatus;
 
+/* 
+ * 获取私有引用计数（线程本地）
+ * 
+ * 背景:
+ * 多线程环境下，每个线程维护自己的缓冲区引用计数
+ * 避免全局锁竞争，提高并发性能
+ * 
+ * PrivateRefCountArray:
+ * - 固定大小的数组（REFCOUNT_ARRAY_ENTRIES 通常为 64）
+ * - 存储最近访问的缓冲区引用
+ * - 超出容量的放入哈希表
+ * 
+ * 返回值:
+ * - 正数：当前线程持有的引用数
+ * - 0: 无引用
+ * 
+ * 使用场景:
+ * ReadBuffer → 增加引用
+ * ReleaseBuffer → 减少引用
+ * 检查泄漏 → 验证引用是否平衡
+ */
 static inline int32 GetPrivateRefCount(Buffer buffer);
+
+/* 
+ * 忘记私有引用计数条目
+ * 
+ * 作用:
+ * 从 PrivateRefCountArray 或哈希表中移除引用条目
+ * 通常在缓冲区被释放或回收时调用
+ * 
+ * 注意:
+ * 必须确保引用计数已归零才能调用此函数
+ * 否则会导致资源泄漏
+ */
 void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
+
+/* 
+ * 检查缓冲区泄漏
+ * 
+ * 时机:
+ * - 事务提交/中止时
+ * - 连接断开前
+ * - 调试模式定期执行
+ * 
+ * 检查内容:
+ * 1. Pin 计数是否平衡（pin_count == 0）
+ * 2. 脏页是否正确标记
+ * 3. 锁状态是否正常
+ * 
+ * 发现泄漏:
+ * - 打印警告信息
+ * - 记录缓冲区标签（BufferTagToString）
+ * - 可能的话自动修复
+ */
 static void CheckForBufferLeaks(void);
+
+/* 
+ * 表空间检查点进度比较器
+ * 
+ * 参数:
+ * a, b: 两个 CkptTsStatus 指针的 Datum 封装
+ * arg: 未使用的额外参数
+ * 
+ * 返回值:
+ * < 0: a->progress < b->progress（a 优先级更高）
+ * = 0: progress 相等
+ * > 0: a->progress > b->progress（b 优先级更高）
+ * 
+ * 应用:
+ * 用于 binaryheap 优先队列
+ * 始终选择进度最小的表空间处理
+ * 实现公平调度
+ */
 static int ts_ckpt_progress_comparator(Datum a, Datum b, void *arg);
-static bool ReadBuffer_common_ReadBlock(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
+
+/* 
+ * 读取块的公共逻辑
+ * 
+ * 功能:
+ * 从磁盘读取数据块到缓冲区
+ * 支持多种读取模式和扩展操作
+ * 
+ * 参数详解:
+ * smgr: 存储管理器关系句柄
+ * relpersistence: 关系持久性（永久/临时/未持久化）
+ * forkNum: 分支号（主分支/可见性映射/初始化分支）
+ * blockNum: 块号
+ * mode: 读取模式（RBM_NORMAL/RBM_ZERO/RBM_REUSE 等）
+ * isExtend: 是否为扩展操作（分配新块）
+ * bufBlock: 目标缓冲区指针
+ * pblk: 物理块信息（用于 WAL 重做）
+ * need_repair: 输出参数，是否需要修复
+ * 
+ * 返回:
+ * true: 读取成功
+ * false: 需要重试或其他处理
+ * 
+ * 流程:
+ * 1. 检查缓冲区是否有效
+ * 2. 如果是 RBM_ZERO，直接清零
+ * 3. 如果是 RBM_NORMAL，从磁盘读取
+ * 4. 校验和检查（如果有）
+ * 5. 解密（如果启用 TDE）
+ * 6. 设置缓冲区标志位
+ */
+static bool ReadBlock_common_ReadBlock(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
     BlockNumber blockNum, ReadBufferMode mode, bool isExtend, Block bufBlock, const XLogPhyBlock *pblk,
     bool *need_repair);
 
-
+/* 
+ * BufferTag 转字符串
+ * 
+ * 用途:
+ * 调试和日志输出时将 BufferTag 格式化为可读字符串
+ * 
+ * 格式:
+ * "表空间 ID/数据库 ID/关系 ID/桶节点 ID 分支号 - 块号"
+ * 例如："1663/16384/1234/0 0-100"
+ * 
+ * 参数:
+ * buftag: 要转换的 BufferTag 指针
+ * resBuffer: 结果缓冲区（可选，NULL 时使用 StringInfo）
+ * len: 结果缓冲区长度
+ * 
+ * 返回:
+ * 格式化后的字符串
+ * 
+ * 示例输出:
+ * "1663/5/2600/0 0-1234" 表示:
+ * - 表空间：1663 (PG_DEFAULTTABLESPACE)
+ * - 数据库：5 (postgres)
+ * - 关系：2600 (pg_class)
+ * - 分支：0 (MAIN_FORKNUM)
+ * - 块号：1234
+ */
 char* BufferTagToString(const BufferTag* buftag, char* resBuffer, int len)
 {
     if (resBuffer == NULL) {
+        // 使用 StringInfo 动态分配
         StringInfoData tag;
         initStringInfo(&tag);
         appendStringInfo(&tag, "%u/%u/%u/%d %d-%u",
@@ -148,6 +318,7 @@ char* BufferTagToString(const BufferTag* buftag, char* resBuffer, int len)
             buftag->forkNum, buftag->blockNum);
         return tag.data;
     } else {
+        // 使用提供的缓冲区
         errno_t rc = snprintf_s(resBuffer, len, len - 1, "%u/%u/%u/%d %d-%u",
             buftag->rnode.spcNode, buftag->rnode.dbNode, buftag->rnode.relNode, buftag->rnode.bucketNode,
             buftag->forkNum, buftag->blockNum);
@@ -161,15 +332,49 @@ char* BufferTagToString(const BufferTag* buftag, char* resBuffer, int len)
  * more entry. This has to be called before using NewPrivateRefCountEntry() to
  * fill a new entry - but it's perfectly fine to not use a reserved entry.
  */
+
+/* 
+ * 预留私有引用计数条目
+ * 
+ * 目的:
+ * 确保 PrivateRefCountArray 有足够空间存储新条目
+ * 在使用 NewPrivateRefCountEntry() 之前必须调用
+ * 
+ * 策略:
+ * 1. 首先尝试在数组中找空闲条目（快速路径）
+ *    - 大多数情况下都够用
+ *    - O(n) 复杂度，n 通常很小（64）
+ * 
+ * 2. 如果数组满了，移动一个条目到哈希表
+ *    - 使用时钟算法选择牺牲者
+ *    - t_thrd.storage_cxt.PrivateRefCountClock 指向当前位置
+ *    - 循环遍历，避免饿死
+ * 
+ * 数据结构:
+ * PrivateRefCountArray: 固定大小数组（快速访问）
+ * PrivateRefCountHash: 哈希表（溢出处理）
+ * 
+ * 线程安全:
+ * 每个线程有自己的 PrivateRefCountArray
+ * 无需加锁，无竞争
+ * 
+ * 性能优化:
+ * - 常见情况（数组有空位）：O(n)
+ * - 罕见情况（数组满）：O(n) + 哈希表操作
+ * - 摊销成本：接近 O(1)
+ */
 void ReservePrivateRefCountEntry(void)
 {
-    /* Already reserved (or freed), nothing to do */
+    /* Already reserved (or freed), nothing to do: 已经预留过，无需重复操作 */
     if (t_thrd.storage_cxt.ReservedRefCountEntry != NULL)
         return;
 
     /*
     * First search for a free entry the array, that'll be sufficient in the
     * majority of cases.
+    * 
+    * 第一步：在数组中查找空闲条目
+    * 这是常见情况，快速路径
     */
     {
         int i;
@@ -188,17 +393,22 @@ void ReservePrivateRefCountEntry(void)
 
     /*
     * No luck. All array entries are full. Move one array entry into the hash
-    * table.
+    * table. Use that slot.
+    * 
+    * 第二步：数组已满，移动一个条目到哈希表
+    * 使用时钟算法选择牺牲者
     */
     {
         /*
         * Move entry from the current clock position in the array into the
         * hashtable. Use that slot.
+        * 
+        * 从时钟当前位置开始，选择一个条目移到哈希表
         */
         PrivateRefCountEntry *hashent;
         bool found;
 
-        /* select victim slot */
+        /* select victim slot: 选择牺牲条目 */
         t_thrd.storage_cxt.ReservedRefCountEntry  =
             &t_thrd.storage_cxt.PrivateRefCountArray[t_thrd.storage_cxt.PrivateRefCountClock++ % REFCOUNT_ARRAY_ENTRIES];
 
@@ -224,6 +434,23 @@ void ReservePrivateRefCountEntry(void)
 /*
  * Fill a previously reserved refcount entry.
  */
+
+/* 
+ * 填充预留的引用计数条目
+ * 
+ * 作用:
+ * 将预留的 PrivateRefCountEntry 填充为指定缓冲区的引用计数
+ * 
+ * 参数:
+ * buffer: 要填充的缓冲区
+ * 
+ * 返回:
+ * 指向填充后的 PrivateRefCountEntry 的指针
+ * 
+ * 注意:
+ * - 必须在 ReservePrivateRefCountEntry() 之后调用
+ * - 填充后，预留条目将被清空
+ */
 PrivateRefCountEntry* NewPrivateRefCountEntry(Buffer buffer)
 {
     PrivateRefCountEntry *res;
@@ -248,6 +475,26 @@ PrivateRefCountEntry* NewPrivateRefCountEntry(Buffer buffer)
  * Returns NULL if a buffer doesn't have a refcount entry. Otherwise, if
  * do_move is true, and the entry resides in the hashtable the entry is
  * optimized for frequent access by moving it to the array.
+ */
+
+/* 
+ * 获取指定缓冲区的私有引用计数条目
+ * 
+ * 作用:
+ * 查找并返回指定缓冲区的 PrivateRefCountEntry
+ * 如果 do_move 为 true，且条目在哈希表中，则将其移动到数组中以优化访问
+ * 
+ * 参数:
+ * buffer: 要查找的缓冲区
+ * do_move: 是否移动条目到数组
+ * 
+ * 返回:
+ * - 找到的 PrivateRefCountEntry 指针
+ * - 未找到时返回 NULL
+ * 
+ * 注意:
+ * - 缓冲区必须有效且非本地缓冲区
+ * - 移动操作仅在哈希表中有条目时进行
  */
 PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move)
 {

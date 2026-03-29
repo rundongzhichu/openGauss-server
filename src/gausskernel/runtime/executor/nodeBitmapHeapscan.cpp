@@ -1,20 +1,169 @@
 /* -------------------------------------------------------------------------
  *
  * nodeBitmapHeapscan.cpp
- *	  Routines to support bitmapped scans of relations
+ *	  支持位图扫描关系的函数
+ *    【核心作用】实现位图索引扫描（Bitmap Index Scan），高效处理多条件组合和大范围查询
  *
- * NOTE: it is critical that this plan type only be used with MVCC-compliant
- * snapshots (ie, regular snapshots, not SnapshotNow or one of the other
- * special snapshots).	The reason is that since index and heap scans are
- * decoupled, there can be no assurance that the index tuple prompting a
- * visit to a particular heap TID still exists when the visit is made.
- * Therefore the tuple might not exist anymore either (which is OK because
- * heap_fetch will cope) --- but worse, the tuple slot could have been
- * re-used for a newer tuple.  With an MVCC snapshot the newer tuple is
- * certain to fail the time qual and so it will not be mistakenly returned.
- * With SnapshotNow we might return a tuple that doesn't meet the required
- * index qual conditions.
+ * ⚠️ MVCC 快照要求:
+ *   此计划类型**必须**与符合 MVCC 的快照一起使用（如普通快照，而非 SnapshotNow 或其他特殊快照）。
+ *   
+ *   原因：
+ *   - 索引扫描和堆扫描是解耦的
+ *   - 无法保证触发访问特定堆 TID 的索引元组在访问时仍然存在
+ *   - 元组可能已不存在（heap_fetch 会处理）
+ *   - **更糟糕的是**: 元组槽可能被重用为更新的元组
+ *   
+ *   MVCC 快照的保障:
+ *   - 新元组一定会失败时间合格检查（time qual）
+ *   - 不会被错误返回
+ *   
+ *   SnapshotNow 的风险:
+ *   - 可能返回不满足所需索引合格条件的元组
+ *   - 导致数据不一致
  *
+ * 位图扫描原理:
+ *   1. 两阶段执行
+ *      阶段一：索引扫描
+ *      - 扫描一个或多个索引
+ *      - 构建 TID 位图（TID Bitmap）
+ *      - 每个位代表一个数据块中的元组
+ *      
+ *      阶段二：堆扫描
+ *      - 根据位图访问堆表数据块
+ *      - 批量读取，减少随机 I/O
+ *      - 应用可见性检查和剩余条件
+ *   
+ *   2. 位图结构
+ *      TIDBitmap: 压缩的位图数据结构
+ *      - 按数据块组织（每块一个 bitmap page）
+ *      - 每块内用偏移量位图表示元组
+ *      - 支持动态扩展
+ *   
+ *   3. 多索引组合
+ *      BitmapAnd: 多个位图取交集
+ *      BitmapOr: 多个位图取并集
+ *      示例：WHERE a = 1 AND b = 2
+ *      → 扫描索引 a 得到位图 A
+ *      → 扫描索引 b 得到位图 B  
+ *      → A AND B → 最终位图
+ *
+ * 接口函数:
+ *		ExecBitmapHeapScan		  - 使用位图信息扫描关系
+ *		ExecBitmapHeapNext		  - 上述函数的主力
+ *		ExecInitBitmapHeapScan	  - 创建并初始化状态信息
+ *		ExecReScanBitmapHeapScan  - 准备重新扫描计划
+ *		ExecEndBitmapHeapScan	  - 释放所有存储
+ *
+ * 关键数据结构:
+ * 
+ * PrefetchNode: 预读节点
+ *   - blockNum: 块号
+ *   - partOid: 分区 OID（分区表切换时使用）
+ *   - bktId: 桶 ID（哈希桶表使用）
+ *
+ * BitmapHeapScanState: 位图堆扫描状态
+ *   - tbm: TIDBitmap 指针（总位图）
+ *   - tbmiterator: TBMIterateResult 迭代器
+ *   - prefetch_iterator: 预读迭代器
+ *   - tbmres: 当前迭代结果
+ *   - ss: 扫描状态基类
+ *
+ * 核心函数分类:
+ * 
+ * 1. 主扫描函数
+ *    - ExecBitmapHeapScan(): 位图堆扫描主函数
+ *    - ExecBitmapHeapNext(): 获取下一个元组
+ *    - BitmapHbucketTblNext(): 哈希桶表扫描（特殊优化）
+ *    - BitmapHeapTblNext(): 普通堆表扫描
+ *
+ * 2. 底层支持
+ *    - heapam_scan_bitmap_next_block(): 获取下一个数据块
+ *    - HeapamScanBitmapNextTuple(): 获取块内下一个元组
+ *    - BitmapHeapPrefetchNext(): 预读下一页
+ *
+ * 3. 初始化和清理
+ *    - ExecInitPartitionForBitmapHeapScan(): 初始化分区扫描
+ *    - ExecInitNextPartitionForBitmapHeapScan(): 初始化下一个分区
+ *    - BitmapHeapFree(): 释放位图资源
+ *
+ * 性能优化:
+ * 
+ * 1. 批量 I/O
+ *    - 一次读取整个数据块
+ *    - 块内所有匹配元组一次性处理
+ *    - 减少磁盘寻道次数
+ * 
+ * 2. 位图压缩
+ *    - 稀疏位图的高效表示
+ *    - 只存储有匹配的数据块
+ *    - 节省内存占用
+ * 
+ * 3. 预读机制
+ *    - 提前读取后续数据块
+ *    - 隐藏 I/O 延迟
+ *    - 流水线执行
+ * 
+ * 4. 分区感知
+ *    - 自动分区剪枝
+ *    - 只扫描相关分区
+ *    - 并行处理多个分区
+ *
+ * 适用场景:
+ *   ✅ 多列 AND 条件（无复合索引时）
+ *   ✅ OR 条件（合并多个索引）
+ *   ✅ 大范围查询（> 10% 数据）
+ *   ✅ 复杂布尔表达式
+ *   ✅ 部分索引 + 全表扫描混合
+ *   ❌ 点查（Index Scan 更优）
+ *   ❌ LIMIT 查询（早期终止优势）
+ *   ❌ 需要排序的场景
+ *
+ * 与 Index Scan 对比:
+ * 
+ * Bitmap Scan 优势:
+ * - 多索引组合灵活
+ * - 大范围查询 I/O 效率高
+ * - 支持复杂的布尔逻辑
+ * - 批量处理减少开销
+ * 
+ * Index Scan 优势:
+ * - 点查快速直接
+ * - 支持 ORDER BY 排序
+ * - LIMIT 早期终止
+ * - Index Only Scan 避免回表
+ *
+ * 代价模型:
+ *   优化器选择 Bitmap Scan 的考量:
+ *   1. 选择性估算：位图的选择度
+ *   2. I/O 成本：顺序 vs 随机
+ *   3. CPU 成本：位图操作开销
+ *   4. 内存成本：位图存储空间
+ *   
+ *   经验法则:
+ *   - 选择性 < 1%: Index Scan
+ *   - 选择性 1%-10%: 视情况而定
+ *   - 选择性 > 10%: Bitmap Scan
+ *   - 多列组合：BitmapAnd 可能更优
+ *
+ * 实战示例:
+ * ```sql
+ * -- 场景 1: 多列 AND 条件
+ * SELECT * FROM t WHERE status = 1 AND type = 'A';
+ * -- 无 (status, type) 复合索引时
+ * -- → BitmapAnd(扫描 status 索引，扫描 type 索引)
+ * 
+ * -- 场景 2: OR 条件
+ * SELECT * FROM t WHERE id = 1 OR name = 'John';
+ * -- → BitmapOr(扫描 id 索引，扫描 name 索引)
+ * 
+ * -- 场景 3: 大范围查询
+ * SELECT * FROM orders WHERE order_date > '2024-01-01';
+ * -- 如果超过 10% 的订单，使用 Bitmap Scan
+ * 
+ * -- 场景 4: 复杂布尔表达式
+ * SELECT * FROM t WHERE (a = 1 AND b = 2) OR (c = 3 AND d = 4);
+ * -- → BitmapOr(BitmapAnd(a,b), BitmapAnd(c,d))
+ * ```
  *
  * Portions Copyright (c) 2020 Huawei Technologies Co.,Ltd.
  * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
