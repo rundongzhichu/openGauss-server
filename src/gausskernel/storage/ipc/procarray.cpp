@@ -1998,6 +1998,8 @@ void AgentCopySnapshot(TransactionId *xmin, TransactionId *xmax, CommitSeqNo *sn
  * Note: this function should probably not be called with an argument that's
  * not statically allocated (see xip allocation below).
  */
+
+ // todo 快照学习
 #ifndef ENABLE_MULTIPLE_NODES
 Snapshot GetSnapshotData(Snapshot snapshot, bool force_local_snapshot, bool forHSFeedBack)
 #else
